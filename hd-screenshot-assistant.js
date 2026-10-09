@@ -258,7 +258,7 @@ async function snapshotPdf(page,args,options={}) {
   const temp=await page.context().newPage();
   try {
     const {cssWidth:w,cssHeight:h}=shot;
-    await temp.setViewportSize({width:w,height:h});
+    // Persistent browser contexts share their viewport; resizing this temporary page can shrink the source page after a regional PDF export.
     const html=`<!doctype html><html><head><style>@page{size:${w}px ${h}px;margin:0}html,body{margin:0;padding:0;width:${w}px;height:${h}px;overflow:hidden}img{width:100%;height:100%;display:block}</style></head><body><img src="data:image/png;base64,${shot.buffer.toString('base64')}"></body></html>`;
     await temp.setContent(html,{waitUntil:'load'});
     await temp.pdf({path:base,printBackground:true,preferCSSPageSize:true,margin:{top:0,bottom:0,left:0,right:0}});
@@ -269,20 +269,53 @@ async function snapshotPdf(page,args,options={}) {
 
 async function vectorPdf(page,args,options={}) {
   fs.mkdirSync(args.outDir,{recursive:true});
-  const filePath=path.join(args.outDir,createName(page,'print-vector','pdf'));
+  const fullPage=Boolean(options.fullPage);
+  const size=await metrics(page,args);
+  const cssWidth=fullPage?size.scrollWidth:size.viewportWidth;
+  const cssHeight=fullPage?size.scrollHeight:size.viewportHeight;
+  const filePath=path.join(args.outDir,createName(page,`print-vector-${fullPage?'full':'viewport'}-${cssWidth}x${cssHeight}`,'pdf'));
   await hiddenToolbar(page,async()=>{
-    // 浏览器打印会采用分页布局，保留可矢量化的文字；不同于精准像素截图。
-    await page.pdf({path:filePath,format:'A4',printBackground:true,preferCSSPageSize:false,
-      margin:{top:'7mm',bottom:'7mm',left:'7mm',right:'7mm'}});
+    await page.evaluate(({width,height})=>{
+      const id='hd-assistant-print-page-size';
+      document.getElementById(id)?.remove();
+      const style=document.createElement('style');
+      style.id=id;
+      style.textContent='@page { size: '+width+'px '+height+'px; margin: 0; }';
+      document.head.appendChild(style);
+    },{width:cssWidth,height:cssHeight}).catch(()=>{});
+    const client=await page.context().newCDPSession(page);
+    try {
+      // 保持屏幕样式，避免目标站点的 print CSS 把界面隐藏成空白 PDF。
+      await client.send('Emulation.setEmulatedMedia',{media:'screen'}).catch(()=>{});
+      const result=await client.send('Page.printToPDF',{
+        printBackground:true,
+        landscape:false,
+        paperWidth:Math.max(cssWidth/96,1),
+        paperHeight:Math.max(cssHeight/96,1),
+        marginTop:0,
+        marginBottom:0,
+        marginLeft:0,
+        marginRight:0,
+        scale:1,
+        preferCSSPageSize:true,
+        displayHeaderFooter:false,
+      });
+      fs.writeFileSync(filePath,Buffer.from(result.data,'base64'));
+    } finally {
+      await client.send('Emulation.setEmulatedMedia',{media:''}).catch(()=>{});
+      await page.evaluate(()=>document.getElementById('hd-assistant-print-page-size')?.remove()).catch(()=>{});
+      await client.detach().catch(()=>{});
+    }
   });
-  console.log(`\n[打印 PDF 已保存] ${filePath}（打印版式可能与屏幕有差异）`);
-  return {filePath};
+  console.log(`\n[打印 PDF 已保存] ${filePath}（保留屏幕样式，矢量内容取决于网页本身）`);
+  return {filePath,cssWidth,cssHeight,format:'pdf',fullPage};
 }
 
 async function runCommand(page,args,mode) {
   const command=String(mode||'').trim().toLowerCase();
   if(['p','pdf','pdf-snapshot'].includes(command))return snapshotPdf(page,args);
-  if(['pv','pf','pdf-vector','pdf-full'].includes(command))return vectorPdf(page,args);
+  if(['pv','pdf-vector'].includes(command))return vectorPdf(page,args,{fullPage:false});
+  if(['pf','pdf-full'].includes(command))return vectorPdf(page,args,{fullPage:true});
   if(['f','full'].includes(command))return capturePage(page,args,{fullPage:true});
   if(['b','both'].includes(command))return {pdf:await snapshotPdf(page,args),png:await capturePage(page,args)};
   return capturePage(page,args);
