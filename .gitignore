@@ -1,0 +1,21 @@
+# Dependencies and generated outputs
+node_modules/
+output/
+dist/
+*.zip
+*.log
+
+# Local browser data / secrets
+.hd-browser-profile/
+.playwright-hd-profile/
+.local/
+.env
+.env.*
+!.env.example
+
+# Python / editor cache
+__pycache__/
+*.py[cod]
+.vscode/
+.idea/
+.cursor/

@@ -1,0 +1,13 @@
+{
+  "name": "general-hd-web-screenshot-helper",
+  "private": true,
+  "version": "2.1.0",
+  "description": "Windows 一键启动的通用高分辨率网页截图工具",
+  "scripts": {
+    "start": "node hd-screenshot-assistant.js",
+    "check": "node --check hd-screenshot-assistant.js && node hd-screenshot-assistant.js --self-test"
+  },
+  "dependencies": {
+    "playwright": "^1.60.0"
+  }
+}

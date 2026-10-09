@@ -1,0 +1,25 @@
+name: Code checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: JavaScript syntax and utility tests
+        run: npm run check
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Optional Python script syntax
+        run: python -m py_compile crop-hd-screenshot.py
