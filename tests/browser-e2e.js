@@ -111,8 +111,8 @@ async function main() {
     assert.ok(trimmedViewport.cssWidth>=522 && trimmedViewport.cssWidth<=538 && trimmedViewport.cssHeight>=382 && trimmedViewport.cssHeight<=398,
       'viewport capture must trim unused right and bottom margins when a bounded page surface exists');
     const trimmedRegion=await captureBuffer(page,args,{rect:{x:20,y:20,width:600,height:440}});
-    assert.deepEqual([trimmedRegion.cssWidth,trimmedRegion.cssHeight],[518,378],
-      'selected capture must preserve its top-left point and trim only the blank right and bottom edges');
+    assert.deepEqual([trimmedRegion.cssWidth,trimmedRegion.cssHeight],[600,440],
+      'user-selected region must keep its exact dimensions even when blank background is inside selection');
 
     await page.setContent(`<!doctype html><style>
       html,body{margin:0;width:1800px;height:1400px;background:#fff}
