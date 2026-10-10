@@ -199,6 +199,12 @@ async function main() {
     assert.ok(large.actualHeight>=3850&&large.actualHeight<=3915,
       'large monitor screenshot must keep correct viewport height without expanding');
     assert.ok(fs.statSync(large.filePath).size>1000,'PNG must be physically saved');
+    const largePdf=await snapshotPdf(page,bigArgs);
+    assert.equal(largePdf.effectiveDpr,3,'large screen snapshot PDF must share adaptive DPR');
+    assert.equal(fs.readFileSync(largePdf.filePath).subarray(0,4).toString(),'%PDF',
+      'large screen PDF must be valid instead of failing on a pixel limit');
+    const fullLarge=await capturePage(page,bigArgs,{fullPage:true});
+    assert.equal(fullLarge.effectiveDpr,3,'full-page PNG must adapt too');
     // Default small selections continue to be full ×4, even after a large capture.
     const largeSelection=await capturePage(page,bigArgs,{rect:{x:20,y:20,width:180,height:120}});
     assert.equal(largeSelection.effectiveDpr,4);
