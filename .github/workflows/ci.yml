@@ -18,6 +18,8 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: JavaScript syntax and utility tests
         run: npm run check
+      - name: Browser screenshot regression (Chrome)
+        run: npm run test:e2e
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
