@@ -131,6 +131,7 @@ function guardPixels(cssW, cssH, scale) {
 function overlayScript(dpr, secret = '') {
   return `(() => {
     const mount = () => {
+    if (window.__HD_DISABLE_OVERLAY__ === true) return;
     if (window.top !== window || !document.documentElement || document.getElementById('hd-assistant-root')) return;
     const trustedToken = ${JSON.stringify(secret)};
     const handlers = {capture: window.__hdCapture, snapshot: window.__hdSnapshot, vector: window.__hdVector};
@@ -301,12 +302,20 @@ async function snapshotPdf(page,args,options={}) {
   try {
     const {cssWidth:w,cssHeight:h}=shot;
     // Persistent browser contexts share their viewport; resizing this temporary page can shrink the source page after a regional PDF export.
-    const html=`<!doctype html><html><head><style>@page{size:${w}px ${h}px;margin:0}html,body{margin:0;padding:0;width:${w}px;height:${h}px;overflow:hidden}img{width:100%;height:100%;display:block}</style></head><body><img src="data:image/png;base64,${shot.buffer.toString('base64')}"></body></html>`;
+    const html=`<!doctype html><html><head><script>window.__HD_DISABLE_OVERLAY__=true</script><style>@page{size:${w}px ${h}px;margin:0}html,body{margin:0;padding:0;width:${w}px;height:${h}px;overflow:hidden}img{width:100%;height:100%;display:block}</style></head><body><img src="data:image/png;base64,${shot.buffer.toString('base64')}"></body></html>`;
     await temp.setContent(html,{waitUntil:'load'});
+    // The persistent context also injects the toolbar into newly-created pages.
+    // Remove any already-scheduled overlay from the PDF staging page before printing.
+    await temp.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    const toolbarExcluded=await temp.evaluate(()=>{
+      document.getElementById('hd-assistant-root')?.remove();
+      return !document.getElementById('hd-assistant-root');
+    });
+    if(!toolbarExcluded)throw new Error('PDF 临时页面未能隐藏截图工具栏');
     await temp.pdf({path:base,printBackground:true,preferCSSPageSize:true,margin:{top:0,bottom:0,left:0,right:0}});
   } finally {await temp.close().catch(()=>{});}
   console.log(`\n[快照 PDF 已保存] ${base}\n[同内容 PNG] ${companionPngPath}`);
-  return {filePath:base,companionPngPath};
+  return {filePath:base,companionPngPath,toolbarExcluded:true};
 }
 
 async function vectorPdf(page,args,options={}) {

@@ -61,6 +61,9 @@ async function main() {
     await ctx.exposeBinding('__hdSnapshot',(source,opts)=>snapshotPdf(source.page,args,opts));
     await ctx.exposeBinding('__hdVector',()=>Promise.resolve({filePath:'test'}));
     await ctx.addInitScript({content:overlayScript(2,token)});
+    const attachToolbar=p=>p.on('domcontentloaded',()=>p.evaluate(overlayScript(2,token)).catch(()=>{}));
+    ctx.on('page',attachToolbar);
+    for(const existing of ctx.pages())attachToolbar(existing);
     await page.goto('about:blank#first');
     await page.setContent('<html><style>html,body{margin:0;background:#f94;height:100%}</style><body>Continuous screenshot regression</body></html>');
     await page.evaluate(overlayScript(2,token));
@@ -109,8 +112,11 @@ async function main() {
     const pdf=await snapshotPdf(page,args);
     assert.equal(fs.existsSync(pdf.filePath),true);
     assert.equal(fs.existsSync(pdf.companionPngPath),true);
+    assert.equal(pdf.toolbarExcluded,true,'the PDF staging page must exclude the injected floating toolbar');
     assert.equal(await containsRgb(page,fs.readFileSync(pdf.companionPngPath),[22,89,197]),false,
       'snapshot PDF companion PNG must exclude the floating toolbar buttons');
+    assert.equal(await page.locator('#hd-assistant-root').evaluate(el=>getComputedStyle(el).visibility),'visible',
+      'toolbar must reappear after PDF export');
     const after=await capturePage(page,args);
     assert.equal(after.actualWidth,1280);
     assert.equal(after.actualHeight,960);
