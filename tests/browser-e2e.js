@@ -20,6 +20,24 @@ async function pixelAt(page, buffer, x, y) {
   },{dataUrl,x,y});
 }
 
+async function containsRgb(page, buffer, color) {
+  const dataUrl=`data:image/png;base64,${buffer.toString('base64')}`;
+  return page.evaluate(async ({dataUrl,color})=>{
+    const image=new Image();
+    image.src=dataUrl;
+    await image.decode();
+    const canvas=document.createElement('canvas');
+    canvas.width=image.naturalWidth;canvas.height=image.naturalHeight;
+    const context=canvas.getContext('2d',{willReadFrequently:true});
+    context.drawImage(image,0,0);
+    const data=context.getImageData(0,0,canvas.width,canvas.height).data;
+    for(let i=0;i<data.length;i+=4){
+      if(data[i]===color[0]&&data[i+1]===color[1]&&data[i+2]===color[2])return true;
+    }
+    return false;
+  },{dataUrl,color});
+}
+
 async function main() {
   const work=fs.mkdtempSync(path.join(os.tmpdir(),'hd-screenshot-e2e-'));
   const outDir=path.join(work,'screenshots');
@@ -47,9 +65,14 @@ async function main() {
     await page.setContent('<html><style>html,body{margin:0;background:#f94;height:100%}</style><body>Continuous screenshot regression</body></html>');
     await page.evaluate(overlayScript(2,token));
     await page.locator('#hd-assistant-root').waitFor();
+    assert.equal(await page.locator('#hd-assistant-root button').first().evaluate(el=>getComputedStyle(el).backgroundColor),'rgb(22, 89, 197)');
     const one=await capturePage(page,args);
     assert.equal(one.actualWidth,1280);
     assert.equal(one.actualHeight,960);
+    assert.equal(await containsRgb(page,fs.readFileSync(one.filePath),[22,89,197]),false,
+      'saved PNG must exclude the floating toolbar buttons');
+    assert.equal(await page.locator('#hd-assistant-root').evaluate(el=>getComputedStyle(el).visibility),'visible',
+      'toolbar must reappear after capture');
     const crop=await capturePage(page,args,{rect:{x:100,y:50,width:280,height:200}});
     assert.equal(crop.actualWidth,560);
     assert.equal(crop.actualHeight,400);
@@ -86,6 +109,8 @@ async function main() {
     const pdf=await snapshotPdf(page,args);
     assert.equal(fs.existsSync(pdf.filePath),true);
     assert.equal(fs.existsSync(pdf.companionPngPath),true);
+    assert.equal(await containsRgb(page,fs.readFileSync(pdf.companionPngPath),[22,89,197]),false,
+      'snapshot PDF companion PNG must exclude the floating toolbar buttons');
     const after=await capturePage(page,args);
     assert.equal(after.actualWidth,1280);
     assert.equal(after.actualHeight,960);

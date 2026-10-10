@@ -116,7 +116,6 @@ async function metrics(page, args) {
       scrollHeight: Math.max(window.innerHeight || fallback.height, root?.scrollHeight || 0, body?.scrollHeight || 0),
       scrollX: Math.max(0, vv?.pageLeft ?? window.scrollX ?? 0),
       scrollY: Math.max(0, vv?.pageTop ?? window.scrollY ?? 0),
-      deviceScaleFactor: window.devicePixelRatio || 1,
       zoom: Math.round((vv?.scale || 1) * 100),
     };
   }, { width: args.width, height: args.height });
@@ -201,12 +200,18 @@ async function hiddenToolbar(page, action) {
     el.style.visibility = 'hidden';
     return previous;
   }).catch(() => null);
+  const hasToolbar = mark !== null;
+  const waitForPaint = () => page.evaluate(() => new Promise(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  })).catch(() => {});
+  if (hasToolbar) await waitForPaint();
   try { return await action(); }
   finally {
     await page.evaluate((previous) => {
       const el = document.getElementById('hd-assistant-root');
       if (el) el.style.visibility = previous == null ? '' : previous;
     }, mark).catch(() => {});
+    if (hasToolbar) await waitForPaint();
   }
 }
 
@@ -246,9 +251,18 @@ async function captureBuffer(page, args, options={}) {
   const client = await page.context().newCDPSession(page);
   let buffer;
   try {
-    // Headed Windows already includes monitor DPI in CDP's backing surface;
-    // compensate for it so --dpr remains the exact requested CSS-pixel scale.
-    const captureScale = args.headless ? args.dpr : args.dpr / sizes.deviceScaleFactor;
+    // Measure the screenshot surface itself. window.devicePixelRatio also
+    // changes with browser zoom, while CDP's base output scale does not.
+    const probeWidth = Math.min(64, viewport.width);
+    const probeHeight = Math.min(64, viewport.height);
+    const probe = await client.send('Page.captureScreenshot', {
+      format:'png', fromSurface:true, captureBeyondViewport:true,
+      clip:{x:sizes.scrollX,y:sizes.scrollY,width:probeWidth,height:probeHeight,scale:1}
+    });
+    const probePixel = pngSize(Buffer.from(probe.data, 'base64'));
+    const surfaceScale = (probePixel.width/probeWidth + probePixel.height/probeHeight)/2;
+    if (!Number.isFinite(surfaceScale) || surfaceScale <= 0) throw new Error('无法校准浏览器截图倍率');
+    const captureScale = args.dpr / surfaceScale;
     const shot = await client.send('Page.captureScreenshot', {
       format:'png', fromSurface:true, captureBeyondViewport:true,
       clip:{...clip, scale:captureScale}
