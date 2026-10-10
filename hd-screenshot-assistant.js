@@ -34,7 +34,7 @@ function normalizeUrl(input, fallback = DEFAULT_URL) {
 
 function parseArgs(argv) {
   const args = {
-    url: null, width: 1600, height: 900, dpr: 4,
+    url: null, width: 1600, height: 900, dpr: 4, fixedViewport: false,
     outDir: path.join(__dirname, 'output', 'hd-screenshots'),
     // 登录态存储到本机用户目录，避免意外把 Cookies 随截图工具压缩包分享出去。
     profileDir: path.join(process.env.LOCALAPPDATA || path.join(__dirname, '.local'), 'HDWebScreenshotAssistant', 'browser-profile'),
@@ -42,8 +42,8 @@ function parseArgs(argv) {
   };
   for (const item of argv.slice(2)) {
     if (item.startsWith('--url=')) args.url = item.slice(6);
-    else if (item.startsWith('--width=')) args.width = Number(item.slice(8));
-    else if (item.startsWith('--height=')) args.height = Number(item.slice(9));
+    else if (item.startsWith('--width=')) { args.width = Number(item.slice(8)); args.fixedViewport = true; }
+    else if (item.startsWith('--height=')) { args.height = Number(item.slice(9)); args.fixedViewport = true; }
     else if (item.startsWith('--dpr=')) args.dpr = Number(item.slice(6));
     else if (item.startsWith('--out=')) args.outDir = path.resolve(item.slice(6));
     else if (item.startsWith('--profile=')) args.profileDir = path.resolve(item.slice(10));
@@ -110,12 +110,13 @@ async function metrics(page, args) {
     const body = document.body;
     const vv = window.visualViewport;
     return {
-      viewportWidth: Math.max(1, Math.ceil(vv?.width || window.innerWidth || fallback.width)),
-      viewportHeight: Math.max(1, Math.ceil(vv?.height || window.innerHeight || fallback.height)),
+      viewportWidth: Math.max(1, Math.ceil(window.innerWidth || vv?.width || fallback.width)),
+      viewportHeight: Math.max(1, Math.ceil(window.innerHeight || vv?.height || fallback.height)),
       scrollWidth: Math.max(window.innerWidth || fallback.width, root?.scrollWidth || 0, body?.scrollWidth || 0),
       scrollHeight: Math.max(window.innerHeight || fallback.height, root?.scrollHeight || 0, body?.scrollHeight || 0),
       scrollX: Math.max(0, vv?.pageLeft ?? window.scrollX ?? 0),
       scrollY: Math.max(0, vv?.pageTop ?? window.scrollY ?? 0),
+      deviceScaleFactor: window.devicePixelRatio || 1,
       zoom: Math.round((vv?.scale || 1) * 100),
     };
   }, { width: args.width, height: args.height });
@@ -231,14 +232,29 @@ async function captureBuffer(page, args, options={}) {
   if (!Number.isFinite(cssWidth) || !Number.isFinite(cssHeight) || cssWidth < 1 || cssHeight < 1)
     throw new Error('截图区域无效，框选范围必须在浏览器可视区域内');
   guardPixels(cssWidth, cssHeight, args.dpr);
-  // 直接使用 Playwright 实际视口截图，以 deviceScaleFactor 输出高清像素，
-  // 避免 CDP clip.scale 扩大画布，产生右侧和底部的大面积空白。
-  const clip = region ? {
-    x: sizes.scrollX + region.x, y: sizes.scrollY + region.y,
-    width: region.width, height: region.height
-  } : undefined;
-  const buffer = await page.screenshot({type:'png', fullPage:full,
-    ...(clip ? {clip} : {}), scale:'device', animations:'disabled', caret:'hide', timeout:60000});
+  // The interactive browser uses the monitor's real viewport (viewport:null).
+  // CDP applies the requested export scale to that viewport without resizing the
+  // visible window. CDP clip coordinates are document coordinates, so a region
+  // selected with clientX/clientY must include the current scroll offset.
+  const clip = full ? {
+    x: 0, y: 0, width: sizes.scrollWidth, height: sizes.scrollHeight
+  } : {
+    x: sizes.scrollX + (region ? region.x : 0),
+    y: sizes.scrollY + (region ? region.y : 0),
+    width: cssWidth, height: cssHeight
+  };
+  const client = await page.context().newCDPSession(page);
+  let buffer;
+  try {
+    // Headed Windows already includes monitor DPI in CDP's backing surface;
+    // compensate for it so --dpr remains the exact requested CSS-pixel scale.
+    const captureScale = args.headless ? args.dpr : args.dpr / sizes.deviceScaleFactor;
+    const shot = await client.send('Page.captureScreenshot', {
+      format:'png', fromSurface:true, captureBeyondViewport:true,
+      clip:{...clip, scale:captureScale}
+    });
+    buffer = Buffer.from(shot.data, 'base64');
+  } finally { await client.detach().catch(()=>{}); }
   const pixel = pngSize(buffer);
   const expectedW = Math.round(cssWidth * args.dpr), expectedH = Math.round(cssHeight * args.dpr);
   if (Math.abs(pixel.width-expectedW)>Math.max(4,expectedW*.025) || Math.abs(pixel.height-expectedH)>Math.max(4,expectedH*.025))
@@ -334,11 +350,11 @@ async function runCommand(page,args,mode) {
 }
 
 async function launchBrowser(args,profileDir) {
+  const fitScreen=!args.headless&&!args.fixedViewport;
   const base={headless:args.headless,locale:'zh-CN',
-    viewport:{width:args.width,height:args.height},
-    deviceScaleFactor:args.dpr,
-    screen:{width:args.width,height:args.height},
-    args:[`--window-size=${args.width+30},${args.height+110}`]};
+    viewport:fitScreen?null:{width:args.width,height:args.height},
+    ...(args.headless?{deviceScaleFactor:args.dpr,screen:{width:args.width,height:args.height}}:{}),
+    args:fitScreen?['--start-maximized']:[`--window-size=${args.width+30},${args.height+110}`]};
   const options=args.browser==='auto'?['chrome','msedge','chromium']:[args.browser];
   const reasons=[];
   for(const channel of options){

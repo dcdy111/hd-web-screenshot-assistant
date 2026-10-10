@@ -4,7 +4,21 @@ const fs=require('node:fs');
 const os=require('node:os');
 const path=require('node:path');
 const {chromium}=require('playwright');
-const {capturePage,snapshotPdf,overlayScript}=require('../hd-screenshot-assistant');
+const {capturePage,captureBuffer,snapshotPdf,overlayScript}=require('../hd-screenshot-assistant');
+
+async function pixelAt(page, buffer, x, y) {
+  const dataUrl=`data:image/png;base64,${buffer.toString('base64')}`;
+  return page.evaluate(async ({dataUrl,x,y})=>{
+    const image=new Image();
+    image.src=dataUrl;
+    await image.decode();
+    const canvas=document.createElement('canvas');
+    canvas.width=image.naturalWidth;canvas.height=image.naturalHeight;
+    const context=canvas.getContext('2d',{willReadFrequently:true});
+    context.drawImage(image,0,0);
+    return Array.from(context.getImageData(x,y,1,1).data);
+  },{dataUrl,x,y});
+}
 
 async function main() {
   const work=fs.mkdtempSync(path.join(os.tmpdir(),'hd-screenshot-e2e-'));
@@ -18,7 +32,7 @@ async function main() {
   });
   try {
     const page=ctx.pages()[0]||await ctx.newPage();
-    const args={width:640,height:480,dpr:2,outDir};
+    const args={width:640,height:480,dpr:2,headless:true,outDir};
     const token='e2e-only';
     let clicks=0;
     await ctx.exposeBinding('__hdCapture',(source,opts)=>{
@@ -39,6 +53,25 @@ async function main() {
     const crop=await capturePage(page,args,{rect:{x:100,y:50,width:280,height:200}});
     assert.equal(crop.actualWidth,560);
     assert.equal(crop.actualHeight,400);
+
+    await page.setContent(`<!doctype html><style>
+      html,body{margin:0;width:1800px;height:1400px;background:#fff}
+      .marker{position:fixed;width:160px;height:120px}
+      #red{left:20px;top:20px;background:#ff0000}
+      #green{left:220px;top:20px;background:#00ff00}
+      #blue{left:20px;top:180px;background:#0000ff}
+    </style><div id="red" class="marker"></div><div id="green" class="marker"></div><div id="blue" class="marker"></div>`);
+    await page.evaluate(overlayScript(2,token));
+    await page.evaluate(()=>window.scrollTo(200,160));
+    await page.waitForFunction(()=>window.scrollX===200&&window.scrollY===160);
+    const scrolledCrop=await captureBuffer(page,args,{rect:{x:10,y:10,width:100,height:100}});
+    assert.equal(scrolledCrop.pixel.width,200);
+    assert.equal(scrolledCrop.pixel.height,200);
+    assert.deepEqual(await pixelAt(page,scrolledCrop.buffer,100,100),[255,0,0,255],
+      'a viewport selection must keep the top-left marker after the document scrolls');
+
+    await page.setContent('<html><style>html,body{margin:0;background:#f94;height:100%}</style><body>Continuous screenshot regression</body></html>');
+    await page.evaluate(overlayScript(2,token));
     await page.getByRole('button',{name:'当前屏PNG'}).click();
     await page.waitForFunction(()=>document.querySelector('#hd-assistant-root')?.innerText.includes('已保存：'));
     assert.equal(clicks,1);
