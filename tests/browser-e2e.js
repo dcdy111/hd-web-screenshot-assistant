@@ -186,8 +186,8 @@ async function main() {
     assert.equal(chooseCaptureDpr(2560,1305,4),3);
     await page.setViewportSize({width:2560,height:1305});
     await page.setContent(`<!doctype html><style>
-      html,body{margin:0;padding:0;width:100%;height:100%;background:#edf1f5}
-      .content{position:relative;box-sizing:border-box;width:100vw;height:100vh;
+      html,body{margin:0;padding:0;width:2560px;height:1305px;background:#edf1f5}
+      .content{position:relative;box-sizing:border-box;width:2560px;height:1305px;
         border:3px solid #000; background:#eef3ff}
       .corner{position:absolute;right:2px;bottom:2px;background:#f00;color:#fff}
     </style><main class="content">Large monitor screenshot <span class="corner">edge</span></main>`);
