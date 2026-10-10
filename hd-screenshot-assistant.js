@@ -511,7 +511,8 @@ async function captureBuffer(page, args, options={}) {
   const full = Boolean(options.fullPage) && !region;
   const startX = full ? 0 : sizes.scrollX + (region ? region.x : 0);
   const startY = full ? 0 : sizes.scrollY + (region ? region.y : 0);
-  const canTrim = full || sizes.hasContentSurface;
+  // 只有整页/当前屏允许自动裁边；用户框选必须严格保持选区尺寸。
+  const canTrim = !region && (full || sizes.hasContentSurface);
   const requestedWidth = region ? region.width : full ? sizes.scrollWidth : viewport.width;
   const requestedHeight = region ? region.height : full ? sizes.scrollHeight : viewport.height;
   let cssWidth = canTrim && sizes.contentWidth > startX
