@@ -136,6 +136,24 @@ async function main() {
     assert.deepEqual([iframeContent.cssWidth,iframeContent.cssHeight],[538,398],
       'a full-window iframe must be cropped to the embedded page content bounds');
 
+    // Regression for the reported multi-monitor screenshot: the DOM's
+    // nearly-transparent full-size shell reaches the viewport edge, but the
+    // actual app panel ends much earlier, leaving a wide blank right/bottom.
+    await page.setContent(\`<!doctype html><style>
+      html,body{margin:0;width:640px;height:480px;background:#f4f7f9}
+      .phantom{position:absolute;left:120px;top:0;width:518px;height:478px;
+        border:1px solid rgba(0,0,0,.001);pointer-events:none}
+      .app{box-sizing:border-box;width:500px;height:370px;
+        background:#fff;border:2px solid #254269}
+    </style><div class="phantom"></div><main class="app"><h1>Working dashboard</h1><p>Trim empty background, not the visible application.</p></main>\`);
+    const noBlank=await captureBuffer(page,args);
+    assert.ok(noBlank.cssWidth>=498 && noBlank.cssWidth<=532,
+      'a barely visible full-size DOM shell must not keep the empty right margin');
+    assert.ok(noBlank.cssHeight>=368 && noBlank.cssHeight<=402,
+      'a barely visible full-size DOM shell must not keep the empty bottom margin');
+    assert.ok(noBlank.pixel.width>=996&&noBlank.pixel.width<=1064,
+      'trimmed screenshot must retain the expected high-resolution pixel scale');
+
     await page.setContent('<html><style>html,body{margin:0;background:#f94;height:100%}</style><body>Continuous screenshot regression</body></html>');
     await page.evaluate(overlayScript(2,token));
     await page.getByRole('button',{name:'当前屏PNG'}).click();
