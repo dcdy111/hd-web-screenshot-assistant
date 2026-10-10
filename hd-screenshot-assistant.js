@@ -104,8 +104,65 @@ function pngSize(buffer) {
   return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
 }
 
+async function frameContentBounds(frame) {
+  return frame.evaluate(() => {
+    const body = document.body;
+    const width = Math.max(1, window.innerWidth || 1);
+    const height = Math.max(1, window.innerHeight || 1);
+    let right = 0, bottom = 0, hasSurface = false, textNodes = 0, textChars = 0;
+    const ignored = element => {
+      for (let current = element; current && current !== body; current = current.parentElement) {
+        if (current.id === 'hd-assistant-root' || current.id === 'hd-select-mask' || current.hidden) return true;
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return true;
+      }
+      return false;
+    };
+    const add = (rect, surface = false) => {
+      if (!rect || rect.width <= 0 || rect.height <= 0) return;
+      const extendsRight = rect.left <= width * 0.15 && rect.right >= width - 2 && rect.right <= width + 2;
+      const extendsBottom = rect.top <= height * 0.15 && rect.bottom >= height - 2 && rect.bottom <= height + 2;
+      if (!extendsRight) right = Math.max(right, Math.min(width, rect.right));
+      if (!extendsBottom) bottom = Math.max(bottom, Math.min(height, rect.bottom));
+      if (surface && (!extendsRight || !extendsBottom)) hasSurface = true;
+    };
+    if (body) {
+      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+      const range = document.createRange();
+      let node;
+      while ((node = walker.nextNode())) {
+        const text = node.nodeValue?.trim();
+        if (!text || ignored(node.parentElement)) continue;
+        textNodes++;
+        textChars += text.length;
+        range.selectNodeContents(node);
+        for (const rect of range.getClientRects()) add(rect);
+      }
+      for (const element of body.querySelectorAll('*')) {
+        if (ignored(element)) continue;
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const style = getComputedStyle(element);
+        const border = ['Top', 'Right', 'Bottom', 'Left'].some(side =>
+          parseFloat(style[`border${side}Width`]) > 0 && style[`border${side}Style`] !== 'none'
+          && style[`border${side}Color`] !== 'rgba(0, 0, 0, 0)');
+        const painted = (style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent')
+          || style.backgroundImage !== 'none' || border || style.boxShadow !== 'none';
+        const media = /^(IMG|VIDEO|CANVAS|SVG|IFRAME|INPUT|BUTTON|SELECT|TEXTAREA)$/.test(element.tagName.toUpperCase());
+        if (painted || media) add(rect, painted || media);
+      }
+    }
+    return {
+      viewportWidth: width, viewportHeight: height,
+      contentWidth: right > 0 ? Math.min(width, Math.ceil(right + 16)) : width,
+      contentHeight: bottom > 0 ? Math.min(height, Math.ceil(bottom + 16)) : height,
+      hasContent: hasSurface || (textNodes >= 8 && textChars >= 80),
+    };
+  });
+}
+
 async function metrics(page, args) {
-  return page.evaluate((fallback) => {
+  const result = await page.evaluate((fallback) => {
     const root = document.documentElement;
     const body = document.body;
     const vv = window.visualViewport;
@@ -223,6 +280,35 @@ async function metrics(page, args) {
       zoom: Math.round((vv?.scale || 1) * 100),
     };
   }, { width: args.width, height: args.height });
+
+  // A full-window iframe can hide the actual app DOM from the parent frame. Measure its visible
+  // content too, then map that bound through the iframe box into the main page's coordinates.
+  let hasLocalContent = result.hasContentSurface;
+  for (const frame of page.frames().slice(1)) {
+    try {
+      const inner = await frameContentBounds(frame);
+      if (!inner.hasContent) continue;
+      const owner = await frame.frameElement();
+      const box = await owner.boundingBox();
+      if (!box || box.width <= 0 || box.height <= 0) continue;
+      const visibleWidth = Math.min(inner.contentWidth, inner.viewportWidth);
+      const visibleHeight = Math.min(inner.contentHeight, inner.viewportHeight);
+      const right = result.scrollX + box.x + visibleWidth * (box.width / inner.viewportWidth);
+      const bottom = result.scrollY + box.y + visibleHeight * (box.height / inner.viewportHeight);
+      const candidateWidth = Math.min(result.scrollWidth, Math.ceil(right));
+      const candidateHeight = Math.min(result.scrollHeight, Math.ceil(bottom));
+      if (!hasLocalContent) {
+        result.contentWidth = candidateWidth;
+        result.contentHeight = candidateHeight;
+      } else {
+        result.contentWidth = Math.max(result.contentWidth, candidateWidth);
+        result.contentHeight = Math.max(result.contentHeight, candidateHeight);
+      }
+      hasLocalContent = true;
+    } catch { /* Cross-origin frame unavailable: keep the safe parent-frame bounds. */ }
+  }
+  result.hasContentSurface = hasLocalContent;
+  return result;
 }
 
 function guardPixels(cssW, cssH, scale) {

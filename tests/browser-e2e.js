@@ -126,6 +126,16 @@ async function main() {
     assert.deepEqual([fixedShell.cssWidth,fixedShell.cssHeight],[538,398],
       'a fixed application shell must not prevent trimming its bounded page content');
 
+    await page.setContent('<iframe id="content-frame"></iframe>');
+    await page.locator('#content-frame').evaluate(frame=>{
+      frame.style.cssText='position:fixed;inset:0;width:100vw;height:100vh;border:0';
+      frame.srcdoc='<!doctype html><style>html,body{margin:0;width:1800px;height:1400px;background:#fff}.page{box-sizing:border-box;position:absolute;left:0;top:0;width:522px;height:382px;border:2px solid #334155;background:#eef2ff;padding:18px}</style><main class="page"><h1>Embedded page content</h1><p>Measure the visible page inside the full-window frame.</p></main>';
+    });
+    await page.frameLocator('#content-frame').locator('.page').waitFor();
+    const iframeContent=await captureBuffer(page,args);
+    assert.deepEqual([iframeContent.cssWidth,iframeContent.cssHeight],[538,398],
+      'a full-window iframe must be cropped to the embedded page content bounds');
+
     await page.setContent('<html><style>html,body{margin:0;background:#f94;height:100%}</style><body>Continuous screenshot regression</body></html>');
     await page.evaluate(overlayScript(2,token));
     await page.getByRole('button',{name:'当前屏PNG'}).click();
