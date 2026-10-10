@@ -109,13 +109,93 @@ async function metrics(page, args) {
     const root = document.documentElement;
     const body = document.body;
     const vv = window.visualViewport;
+    const viewportWidth = Math.max(1, Math.ceil(window.innerWidth || vv?.width || fallback.width));
+    const viewportHeight = Math.max(1, Math.ceil(window.innerHeight || vv?.height || fallback.height));
+    const scrollX = Math.max(0, vv?.pageLeft ?? window.scrollX ?? 0);
+    const scrollY = Math.max(0, vv?.pageTop ?? window.scrollY ?? 0);
+    const scrollWidth = Math.max(viewportWidth, root?.scrollWidth || 0, body?.scrollWidth || 0);
+    const scrollHeight = Math.max(viewportHeight, root?.scrollHeight || 0, body?.scrollHeight || 0);
+    let contentRight = 0;
+    let contentBottom = 0;
+    let hasContentSurface = false;
+    const padding = 16;
+    const styles = new WeakMap();
+    const visibility = new WeakMap();
+    const styleOf = element => {
+      let style = styles.get(element);
+      if (!style) { style = getComputedStyle(element); styles.set(element, style); }
+      return style;
+    };
+    const ignored = (element) => {
+      const chain = [];
+      for (let current = element; current && current !== body; current = current.parentElement) {
+        const known = visibility.get(current);
+        if (known !== undefined) {
+          for (const item of chain) visibility.set(item, known);
+          return known;
+        }
+        chain.push(current);
+        if (current.id === 'hd-assistant-root' || current.id === 'hd-select-mask' || current.hidden) {
+          for (const item of chain) visibility.set(item, true);
+          return true;
+        }
+        const style = styleOf(current);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0
+          || style.position === 'fixed' || style.position === 'sticky') {
+          for (const item of chain) visibility.set(item, true);
+          return true;
+        }
+      }
+      for (const item of chain) visibility.set(item, false);
+      return false;
+    };
+    const addBox = (rect, surface = false) => {
+      if (!rect || rect.width <= 0 || rect.height <= 0) return;
+      const right = rect.right + scrollX;
+      const bottom = rect.bottom + scrollY;
+      // 页面背景、铺满视口的根容器并不代表内容的实际边界；文本、图片和子卡片仍会提供边界。
+      const spansViewportRight = rect.left <= viewportWidth * 0.15
+        && rect.right >= viewportWidth - 2 && rect.right <= viewportWidth + 2;
+      const spansViewportBottom = rect.top <= viewportHeight * 0.15
+        && rect.bottom >= viewportHeight - 2 && rect.bottom <= viewportHeight + 2;
+      if (!spansViewportRight) contentRight = Math.max(contentRight, right);
+      if (!spansViewportBottom) contentBottom = Math.max(contentBottom, bottom);
+      if (surface && (!spansViewportRight || !spansViewportBottom)) hasContentSurface = true;
+    };
+
+    if (body) {
+      // Text bounds retain actual content edges without counting a viewport-sized body background.
+      const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+      const range = document.createRange();
+      let node;
+      while ((node = walker.nextNode())) {
+        if (!node.nodeValue?.trim() || ignored(node.parentElement)) continue;
+        range.selectNodeContents(node);
+        for (const rect of range.getClientRects()) addBox(rect);
+      }
+
+      // Painted cards, table rows, controls and media preserve their intended padding and edges.
+      for (const element of body.querySelectorAll('*')) {
+        if (ignored(element)) continue;
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        const style = styleOf(element);
+        const border = ['Top', 'Right', 'Bottom', 'Left'].some(side =>
+          parseFloat(style[`border${side}Width`]) > 0 && style[`border${side}Style`] !== 'none'
+          && style[`border${side}Color`] !== 'rgba(0, 0, 0, 0)');
+        const painted = (style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent')
+          || style.backgroundImage !== 'none' || border || style.boxShadow !== 'none';
+        const media = /^(IMG|VIDEO|CANVAS|SVG|IFRAME|INPUT|BUTTON|SELECT|TEXTAREA)$/.test(element.tagName);
+        if (painted || media) addBox(rect, painted || media);
+      }
+    }
+
+    const contentWidth = contentRight > 0 ? Math.min(scrollWidth, Math.ceil(contentRight + padding)) : scrollWidth;
+    const contentHeight = contentBottom > 0 ? Math.min(scrollHeight, Math.ceil(contentBottom + padding)) : scrollHeight;
     return {
-      viewportWidth: Math.max(1, Math.ceil(window.innerWidth || vv?.width || fallback.width)),
-      viewportHeight: Math.max(1, Math.ceil(window.innerHeight || vv?.height || fallback.height)),
-      scrollWidth: Math.max(window.innerWidth || fallback.width, root?.scrollWidth || 0, body?.scrollWidth || 0),
-      scrollHeight: Math.max(window.innerHeight || fallback.height, root?.scrollHeight || 0, body?.scrollHeight || 0),
-      scrollX: Math.max(0, vv?.pageLeft ?? window.scrollX ?? 0),
-      scrollY: Math.max(0, vv?.pageTop ?? window.scrollY ?? 0),
+      viewportWidth, viewportHeight, scrollWidth, scrollHeight,
+      contentWidth, contentHeight, hasContentSurface,
+      scrollX, scrollY,
       zoom: Math.round((vv?.scale || 1) * 100),
     };
   }, { width: args.width, height: args.height });
@@ -233,8 +313,15 @@ async function captureBuffer(page, args, options={}) {
     height: Math.min(regionRequested.height, viewport.height - regionRequested.y),
   } : null;
   const full = Boolean(options.fullPage) && !region;
-  const cssWidth = region ? region.width : full ? sizes.scrollWidth : viewport.width;
-  const cssHeight = region ? region.height : full ? sizes.scrollHeight : viewport.height;
+  const startX = full ? 0 : sizes.scrollX + (region ? region.x : 0);
+  const startY = full ? 0 : sizes.scrollY + (region ? region.y : 0);
+  const canTrim = full || sizes.hasContentSurface;
+  const requestedWidth = region ? region.width : full ? sizes.scrollWidth : viewport.width;
+  const requestedHeight = region ? region.height : full ? sizes.scrollHeight : viewport.height;
+  const cssWidth = canTrim && sizes.contentWidth > startX
+    ? Math.min(requestedWidth, sizes.contentWidth - startX) : requestedWidth;
+  const cssHeight = canTrim && sizes.contentHeight > startY
+    ? Math.min(requestedHeight, sizes.contentHeight - startY) : requestedHeight;
   if (!Number.isFinite(cssWidth) || !Number.isFinite(cssHeight) || cssWidth < 1 || cssHeight < 1)
     throw new Error('截图区域无效，框选范围必须在浏览器可视区域内');
   guardPixels(cssWidth, cssHeight, args.dpr);
@@ -243,10 +330,10 @@ async function captureBuffer(page, args, options={}) {
   // visible window. CDP clip coordinates are document coordinates, so a region
   // selected with clientX/clientY must include the current scroll offset.
   const clip = full ? {
-    x: 0, y: 0, width: sizes.scrollWidth, height: sizes.scrollHeight
+    x: 0, y: 0, width: cssWidth, height: cssHeight
   } : {
-    x: sizes.scrollX + (region ? region.x : 0),
-    y: sizes.scrollY + (region ? region.y : 0),
+    x: startX,
+    y: startY,
     width: cssWidth, height: cssHeight
   };
   const client = await page.context().newCDPSession(page);

@@ -96,6 +96,24 @@ async function main() {
     assert.deepEqual(await pixelAt(page,scrolledCrop.buffer,100,100),[255,0,0,255],
       'a viewport selection must keep the top-left marker after the document scrolls');
 
+    await page.setContent(`<!doctype html><style>
+      html,body{margin:0;width:1800px;height:1400px;background:#fff}
+      .page{box-sizing:border-box;position:absolute;left:0;top:0;width:522px;height:382px;
+        border:2px solid #334155;background:#eef2ff;padding:18px}
+      .hidden-outside{position:absolute;left:1600px;top:1300px;width:100px;height:80px;background:#f00;opacity:0}
+    </style><main class="page"><h1>Visible page content</h1><p>Keep the card edge and crop the blank viewport.</p></main><div class="hidden-outside"></div>`);
+    await page.evaluate(()=>window.scrollTo(0,0));
+    await page.waitForFunction(()=>window.scrollX===0&&window.scrollY===0);
+    const trimmedFull=await captureBuffer(page,args,{fullPage:true});
+    assert.deepEqual([trimmedFull.cssWidth,trimmedFull.cssHeight],[538,398],
+      'full-page capture must crop viewport-sized blank space to the painted content edge');
+    const trimmedViewport=await captureBuffer(page,args);
+    assert.deepEqual([trimmedViewport.cssWidth,trimmedViewport.cssHeight],[538,398],
+      'viewport capture must trim unused right and bottom margins when a bounded page surface exists');
+    const trimmedRegion=await captureBuffer(page,args,{rect:{x:20,y:20,width:600,height:440}});
+    assert.deepEqual([trimmedRegion.cssWidth,trimmedRegion.cssHeight],[518,378],
+      'selected capture must preserve its top-left point and trim only the blank right and bottom edges');
+
     await page.setContent('<html><style>html,body{margin:0;background:#f94;height:100%}</style><body>Continuous screenshot regression</body></html>');
     await page.evaluate(overlayScript(2,token));
     await page.getByRole('button',{name:'当前屏PNG'}).click();
