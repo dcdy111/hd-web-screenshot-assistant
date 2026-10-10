@@ -4,7 +4,7 @@ const fs=require('node:fs');
 const os=require('node:os');
 const path=require('node:path');
 const {chromium}=require('playwright');
-const {capturePage,captureBuffer,snapshotPdf,overlayScript}=require('../hd-screenshot-assistant');
+const {capturePage,captureBuffer,snapshotPdf,vectorPdf,chooseCaptureDpr,overlayScript}=require('../hd-screenshot-assistant');
 
 async function pixelAt(page, buffer, x, y) {
   const dataUrl=`data:image/png;base64,${buffer.toString('base64')}`;
@@ -178,7 +178,33 @@ async function main() {
     const after=await capturePage(page,args);
     assert.equal(after.actualWidth,1280);
     assert.equal(after.actualHeight,960);
-    console.log('Browser E2E passed: viewport, selected region, repeat, reload, PDF and screenshot after PDF');
+    const vector=await vectorPdf(page,args,{fullPage:false});
+    assert.equal(fs.readFileSync(vector.filePath).subarray(0,4).toString(),'%PDF',
+      'vector PDF button must actually produce a PDF');
+    // Reproduce reported user case: 2560×1305 @ ×4 = 53.4M pixels,
+    // larger than the 45M safety ceiling. Must AUTO-DOWNGRADE, not fail.
+    assert.equal(chooseCaptureDpr(2560,1305,4),3);
+    await page.setViewportSize({width:2560,height:1305});
+    await page.setContent(`<!doctype html><style>
+      html,body{margin:0;padding:0;width:100%;height:100%;background:#edf1f5}
+      .content{position:relative;box-sizing:border-box;width:100vw;height:100vh;
+        border:3px solid #000; background:#eef3ff}
+      .corner{position:absolute;right:2px;bottom:2px;background:#f00;color:#fff}
+    </style><main class="content">Large monitor screenshot <span class="corner">edge</span></main>`);
+    const bigArgs={...args,dpr:4,width:2560,height:1305};
+    const large=await capturePage(page,bigArgs);
+    assert.equal(large.effectiveDpr,3,'4x should safely adapt to 3x on 2560x1305 viewport');
+    assert.ok(large.actualWidth>=7500&&large.actualWidth<=7680,
+      'large monitor screenshot must keep correct viewport width without expanding');
+    assert.ok(large.actualHeight>=3850&&large.actualHeight<=3915,
+      'large monitor screenshot must keep correct viewport height without expanding');
+    assert.ok(fs.statSync(large.filePath).size>1000,'PNG must be physically saved');
+    // Default small selections continue to be full ×4, even after a large capture.
+    const largeSelection=await capturePage(page,bigArgs,{rect:{x:20,y:20,width:180,height:120}});
+    assert.equal(largeSelection.effectiveDpr,4);
+    assert.equal(largeSelection.actualWidth,720);
+    assert.equal(largeSelection.actualHeight,480);
+    console.log('Browser E2E passed: continuous capture, PDF, viewport bounds, and adaptive DPR on 2560x1305');
   } finally {
     await ctx.close();
     fs.rmSync(work,{recursive:true,force:true});
