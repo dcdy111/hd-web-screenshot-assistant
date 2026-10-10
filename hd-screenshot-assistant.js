@@ -185,7 +185,7 @@ async function metrics(page, args) {
           && style[`border${side}Color`] !== 'rgba(0, 0, 0, 0)');
         const painted = (style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent')
           || style.backgroundImage !== 'none' || border || style.boxShadow !== 'none';
-        const media = /^(IMG|VIDEO|CANVAS|SVG|IFRAME|INPUT|BUTTON|SELECT|TEXTAREA)$/.test(element.tagName);
+        const media = /^(IMG|VIDEO|CANVAS|SVG|IFRAME|INPUT|BUTTON|SELECT|TEXTAREA)$/.test(element.tagName.toUpperCase());
         if (painted || media) addBox(rect, painted || media);
       }
     }
