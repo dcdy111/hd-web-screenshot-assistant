@@ -406,6 +406,92 @@ async function hiddenToolbar(page, action) {
   }
 }
 
+// 校对浏览器实际渲染像素，识别右侧/底部与页面背景一致的连续空白区域。
+// 与 DOM 内容边界互补：一些网站会绘制铺满视口的外层壳，DOM 检测无法判断其是否有真实内容。
+// 为避免裁掉用户想要的内容，只在空白比例显著且边缘背景稳定时修剪；任何异常都保留原区域。
+async function renderedContentBounds(page) {
+  let previous = null;
+  try {
+    previous = await page.evaluate(() => {
+      const el = document.getElementById('hd-assistant-root');
+      if (!el) return null;
+      const old = el.style.visibility;
+      el.style.visibility = 'hidden';
+      return old;
+    }).catch(() => null);
+    const preview = await page.screenshot({
+      type: 'png', fullPage: false, scale: 'css',
+      animations: 'disabled', caret: 'hide', timeout: 30000,
+    });
+    return await page.evaluate(async base64 => {
+      const image = new Image();
+      image.src = 'data:image/png;base64,' + base64;
+      await image.decode();
+      const width = image.naturalWidth, height = image.naturalHeight;
+      if (width < 400 || height < 300) return null;
+      const canvas = document.createElement('canvas');
+      canvas.width = width; canvas.height = height;
+      const context = canvas.getContext('2d', {willReadFrequently:true});
+      if (!context) return null;
+      context.drawImage(image, 0, 0);
+      const rgba = context.getImageData(0, 0, width, height).data;
+      canvas.width = 0; canvas.height = 0;
+      const differs = (offsetA, offsetB) =>
+        Math.abs(rgba[offsetA]-rgba[offsetB]) > 9 ||
+        Math.abs(rgba[offsetA+1]-rgba[offsetB+1]) > 9 ||
+        Math.abs(rgba[offsetA+2]-rgba[offsetB+2]) > 9;
+      // 使用同行/同列背景而非固定白色；支持浅灰、深色主题。
+      // 对边缘背景取靠内侧 12px，避开系统滚动条和截图最外侧锯齿。
+      const referenceX = width - 12, referenceY = height - 12;
+      let right = width, bottom = height;
+      const stepY = Math.max(4, Math.round(height/150));
+      const ySamples = [];
+      for (let y=14; y<height-14; y+=stepY) ySamples.push(y);
+      const xActive = x => {
+        let mismatches=0;
+        for (const y of ySamples) {
+          const offset=(y*width+x)*4, reference=(y*width+referenceX)*4;
+          if (differs(offset,reference)) mismatches++;
+        }
+        return mismatches / ySamples.length > 0.16;
+      };
+      for (let x=width-18; x>=0; x-=2) {
+        if (xActive(x) && xActive(Math.max(0,x-2))) {right=Math.min(width,x+14);break;}
+      }
+      // 只删除明显的空白，忽略极窄留白或边缘的阴影。
+      if (width-right < Math.max(28, Math.ceil(width*0.04))) right=width;
+      const stepX=Math.max(4,Math.round(right/150));
+      const xSamples=[];
+      for(let x=14; x<right-14; x+=stepX) xSamples.push(x);
+      if (xSamples.length) {
+        const yActive = y => {
+          let mismatches=0;
+          for(const x of xSamples) {
+            if (differs((y*width+x)*4,(referenceY*width+x)*4)) mismatches++;
+          }
+          return mismatches/xSamples.length > 0.18;
+        };
+        for(let y=height-18;y>=0;y-=2) {
+          if(yActive(y)&&yActive(Math.max(0,y-2))) {bottom=Math.min(height,y+14);break;}
+        }
+      }
+      if(height-bottom < Math.max(24,Math.ceil(height*0.04))) bottom=height;
+      // 不接受大幅裁剪：这类页面可能有画布、纹理背景或未渲染的内容。
+      if (right < width*0.5) right=width;
+      if (bottom < height*0.5) bottom=height;
+      return {width,height,right,bottom};
+    }, preview.toString('base64'));
+  } catch(err) {
+    console.warn('像素边界检测未完成，保留原截图范围：'+String(err.message||err).slice(0,120));
+    return null;
+  } finally {
+    if (previous !== null) await page.evaluate(value => {
+      const el=document.getElementById('hd-assistant-root');
+      if(el) el.style.visibility=value;
+    },previous).catch(()=>{});
+  }
+}
+
 async function captureBuffer(page, args, options={}) {
   const sizes = await metrics(page, args);
   const viewport = page.viewportSize() || {width: sizes.viewportWidth, height: sizes.viewportHeight};
@@ -428,10 +514,21 @@ async function captureBuffer(page, args, options={}) {
   const canTrim = full || sizes.hasContentSurface;
   const requestedWidth = region ? region.width : full ? sizes.scrollWidth : viewport.width;
   const requestedHeight = region ? region.height : full ? sizes.scrollHeight : viewport.height;
-  const cssWidth = canTrim && sizes.contentWidth > startX
+  let cssWidth = canTrim && sizes.contentWidth > startX
     ? Math.min(requestedWidth, sizes.contentWidth - startX) : requestedWidth;
-  const cssHeight = canTrim && sizes.contentHeight > startY
+  let cssHeight = canTrim && sizes.contentHeight > startY
     ? Math.min(requestedHeight, sizes.contentHeight - startY) : requestedHeight;
+  // 普通当前屏进一步排除网站未使用的纯色边缘。
+  // 框选按用户坐标原样输出；整页仍以页面/DOM边界为准。
+  if (!region && !full) {
+    const pixels = await renderedContentBounds(page);
+    if (pixels) {
+      const scaleX=viewport.width/pixels.width,scaleY=viewport.height/pixels.height;
+      const trimW=Math.ceil(pixels.right*scaleX),trimH=Math.ceil(pixels.bottom*scaleY);
+      cssWidth=Math.min(cssWidth,trimW);
+      cssHeight=Math.min(cssHeight,trimH);
+    }
+  }
   if (!Number.isFinite(cssWidth) || !Number.isFinite(cssHeight) || cssWidth < 1 || cssHeight < 1)
     throw new Error('截图区域无效，框选范围必须在浏览器可视区域内');
   guardPixels(cssWidth, cssHeight, args.dpr);
