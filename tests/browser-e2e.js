@@ -114,6 +114,18 @@ async function main() {
     assert.deepEqual([trimmedRegion.cssWidth,trimmedRegion.cssHeight],[518,378],
       'selected capture must preserve its top-left point and trim only the blank right and bottom edges');
 
+    await page.setContent(`<!doctype html><style>
+      html,body{margin:0;width:1800px;height:1400px;background:#fff}
+      .fixed-shell{position:fixed;inset:0;background:#f6f7f9}
+      .fixed-page{box-sizing:border-box;position:absolute;left:0;top:0;width:522px;height:382px;
+        border:2px solid #334155;background:#eef2ff;padding:18px}
+    </style><div class="fixed-shell"><main class="fixed-page"><h1>Fixed application shell</h1><p>The page card still determines the visible content boundary.</p></main></div>`);
+    await page.evaluate(()=>window.scrollTo(0,0));
+    await page.waitForFunction(()=>window.scrollX===0&&window.scrollY===0);
+    const fixedShell=await captureBuffer(page,args);
+    assert.deepEqual([fixedShell.cssWidth,fixedShell.cssHeight],[538,398],
+      'a fixed application shell must not prevent trimming its bounded page content');
+
     await page.setContent('<html><style>html,body{margin:0;background:#f94;height:100%}</style><body>Continuous screenshot regression</body></html>');
     await page.evaluate(overlayScript(2,token));
     await page.getByRole('button',{name:'当前屏PNG'}).click();

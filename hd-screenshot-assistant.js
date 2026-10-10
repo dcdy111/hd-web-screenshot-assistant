@@ -118,9 +118,12 @@ async function metrics(page, args) {
     let contentRight = 0;
     let contentBottom = 0;
     let hasContentSurface = false;
+    let visibleTextNodes = 0;
+    let visibleTextChars = 0;
     const padding = 16;
     const styles = new WeakMap();
     const visibility = new WeakMap();
+    const pinnedLayout = new WeakMap();
     const styleOf = element => {
       let style = styles.get(element);
       if (!style) { style = getComputedStyle(element); styles.set(element, style); }
@@ -140,8 +143,7 @@ async function metrics(page, args) {
           return true;
         }
         const style = styleOf(current);
-        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0
-          || style.position === 'fixed' || style.position === 'sticky') {
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
           for (const item of chain) visibility.set(item, true);
           return true;
         }
@@ -149,10 +151,28 @@ async function metrics(page, args) {
       for (const item of chain) visibility.set(item, false);
       return false;
     };
-    const addBox = (rect, surface = false) => {
+    const isViewportPinned = (element) => {
+      const chain = [];
+      for (let current = element; current && current !== body; current = current.parentElement) {
+        const known = pinnedLayout.get(current);
+        if (known !== undefined) {
+          for (const item of chain) pinnedLayout.set(item, known);
+          return known;
+        }
+        chain.push(current);
+        const position = styleOf(current).position;
+        if (position === 'fixed' || position === 'sticky') {
+          for (const item of chain) pinnedLayout.set(item, true);
+          return true;
+        }
+      }
+      for (const item of chain) pinnedLayout.set(item, false);
+      return false;
+    };
+    const addBox = (rect, surface = false, viewportPinned = false) => {
       if (!rect || rect.width <= 0 || rect.height <= 0) return;
-      const right = rect.right + scrollX;
-      const bottom = rect.bottom + scrollY;
+      const right = rect.right + (viewportPinned ? 0 : scrollX);
+      const bottom = rect.bottom + (viewportPinned ? 0 : scrollY);
       // 页面背景、铺满视口的根容器并不代表内容的实际边界；文本、图片和子卡片仍会提供边界。
       const spansViewportRight = rect.left <= viewportWidth * 0.15
         && rect.right >= viewportWidth - 2 && rect.right <= viewportWidth + 2;
@@ -170,8 +190,11 @@ async function metrics(page, args) {
       let node;
       while ((node = walker.nextNode())) {
         if (!node.nodeValue?.trim() || ignored(node.parentElement)) continue;
+        visibleTextNodes++;
+        visibleTextChars += node.nodeValue.trim().length;
         range.selectNodeContents(node);
-        for (const rect of range.getClientRects()) addBox(rect);
+        const viewportPinned = isViewportPinned(node.parentElement);
+        for (const rect of range.getClientRects()) addBox(rect, false, viewportPinned);
       }
 
       // Painted cards, table rows, controls and media preserve their intended padding and edges.
@@ -186,7 +209,7 @@ async function metrics(page, args) {
         const painted = (style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent')
           || style.backgroundImage !== 'none' || border || style.boxShadow !== 'none';
         const media = /^(IMG|VIDEO|CANVAS|SVG|IFRAME|INPUT|BUTTON|SELECT|TEXTAREA)$/.test(element.tagName.toUpperCase());
-        if (painted || media) addBox(rect, painted || media);
+        if (painted || media) addBox(rect, painted || media, isViewportPinned(element));
       }
     }
 
@@ -194,7 +217,8 @@ async function metrics(page, args) {
     const contentHeight = contentBottom > 0 ? Math.min(scrollHeight, Math.ceil(contentBottom + padding)) : scrollHeight;
     return {
       viewportWidth, viewportHeight, scrollWidth, scrollHeight,
-      contentWidth, contentHeight, hasContentSurface,
+      contentWidth, contentHeight,
+      hasContentSurface: hasContentSurface || (visibleTextNodes >= 8 && visibleTextChars >= 80),
       scrollX, scrollY,
       zoom: Math.round((vv?.scale || 1) * 100),
     };
