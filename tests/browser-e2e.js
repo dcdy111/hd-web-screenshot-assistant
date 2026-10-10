@@ -181,6 +181,9 @@ async function main() {
     const vector=await vectorPdf(page,args,{fullPage:false});
     assert.equal(fs.readFileSync(vector.filePath).subarray(0,4).toString(),'%PDF',
       'vector PDF button must actually produce a PDF');
+    const vectorFull=await vectorPdf(page,args,{fullPage:true});
+    assert.equal(fs.readFileSync(vectorFull.filePath).subarray(0,4).toString(),'%PDF',
+      'Print PDF (full-page button) must actually produce a PDF');
     // Reproduce reported user case: 2560×1305 @ ×4 = 53.4M pixels,
     // larger than the 45M safety ceiling. Must AUTO-DOWNGRADE, not fail.
     assert.equal(chooseCaptureDpr(2560,1305,4),3);
