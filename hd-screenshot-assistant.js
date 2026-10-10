@@ -5,9 +5,10 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const crypto = require('crypto');
 
 const DEFAULT_URL = 'http://43.139.69.134:18080/'; // 回车默认打开瞳序，不限制其他网站。
-const MAX_PIXELS = 105_000_000; // 防止超长高倍率截图耗尽内存。
+const MAX_PIXELS = 45_000_000; // 防止超长高倍率截图耗尽内存。
 
 function normalizeUrl(input, fallback = DEFAULT_URL) {
   let raw = String(input ?? '').trim();
@@ -127,10 +128,13 @@ function guardPixels(cssW, cssH, scale) {
   }
 }
 
-function overlayScript(dpr) {
+function overlayScript(dpr, secret = '') {
   return `(() => {
-    const old = document.getElementById('hd-assistant-root'); if (old) old.remove();
-    if (!document.documentElement) return;
+    const mount = () => {
+    if (window.top !== window || !document.documentElement || document.getElementById('hd-assistant-root')) return;
+    const trustedToken = ${JSON.stringify(secret)};
+    const handlers = {capture: window.__hdCapture, snapshot: window.__hdSnapshot, vector: window.__hdVector};
+    const invoke = (which, opts = {}) => handlers[which]({...opts, __hdToken: trustedToken});
     const root = document.createElement('div'); root.id='hd-assistant-root';
     root.style.cssText='position:fixed;top:66px;right:16px;z-index:2147483647;max-width:370px;background:rgba(255,255,255,.97);padding:8px;border:1px solid #94a3b8;border-radius:12px;box-shadow:0 10px 28px #0003;display:flex;gap:5px;flex-wrap:wrap;align-items:center;font:13px system-ui,sans-serif;color:#0f172a';
     const label=document.createElement('span');label.textContent='截图 HD ×${dpr}';label.style.cssText='font-weight:700;padding:5px';root.append(label);
@@ -161,12 +165,12 @@ function overlayScript(dpr) {
         if(rect.width<20||rect.height<20)reject(new Error('选区太小'));else resolve(rect);
       });
     });
-    makeBtn('当前屏PNG',()=>window.__hdCapture({}),'最适合Word和PPT');
-    makeBtn('框选PNG',async()=>window.__hdCapture({rect:await selectRect()}),'截取局部，保持真实像素');
-    makeBtn('整页PNG',()=>window.__hdCapture({fullPage:true}),'过长页面建议降低DPR');
-    makeBtn('当前屏PDF',()=>window.__hdSnapshot({}),'嵌入PNG的视觉快照PDF');
-    makeBtn('框选PDF',async()=>window.__hdSnapshot({rect:await selectRect()}),'嵌入高清截图的局部PDF');
-    makeBtn('打印PDF',()=>window.__hdVector({fullPage:true}),'尽量保留网页文字矢量属性；排版可能变化');
+    makeBtn('当前屏PNG',()=>invoke('capture', {}),'最适合Word和PPT');
+    makeBtn('框选PNG',async()=>invoke('capture', {rect:await selectRect()}),'截取局部，保持真实像素');
+    makeBtn('整页PNG',()=>invoke('capture', {fullPage:true}),'过长页面建议降低DPR');
+    makeBtn('当前屏PDF',()=>invoke('snapshot', {}),'嵌入PNG的视觉快照PDF');
+    makeBtn('框选PDF',async()=>invoke('snapshot', {rect:await selectRect()}),'嵌入高清截图的局部PDF');
+    makeBtn('打印PDF',()=>invoke('vector', {fullPage:true}),'尽量保留网页文字矢量属性；排版可能变化');
     const hide=document.createElement('button');hide.textContent='—';hide.title='隐藏/展开工具栏';hide.style.cssText='border:1px solid #94a3b8;border-radius:5px;background:#f1f5f9;padding:5px;cursor:pointer';
     let collapsed=false;
     hide.onclick=()=>{collapsed=!collapsed;[...root.children].forEach(c=>{if(c!==label&&c!==hide)c.style.display=collapsed?'none':''});hide.textContent=collapsed?'+':'—'};
@@ -175,12 +179,15 @@ function overlayScript(dpr) {
       window.addEventListener('keydown',async(e)=>{
         const hot=(e.altKey&&e.shiftKey)||(e.ctrlKey&&e.altKey);if(!hot)return;
         let work=null;
-        if(e.code==='KeyS')work=()=>window.__hdCapture({});
-        else if(e.code==='KeyF')work=()=>window.__hdCapture({fullPage:true});
-        else if(e.code==='KeyP')work=()=>window.__hdSnapshot({});
+        if(e.code==='KeyS')work=()=>invoke('capture', {});
+        else if(e.code==='KeyF')work=()=>invoke('capture', {fullPage:true});
+        else if(e.code==='KeyP')work=()=>invoke('snapshot', {});
         if(work){e.preventDefault();try{await work()}catch(err){console.error('[截图失败]',err)}}
       },true);
     }
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount, {once: true});
+    else mount();
   })();`;
 }
 
@@ -204,34 +211,39 @@ async function hiddenToolbar(page, action) {
 
 async function captureBuffer(page, args, options={}) {
   const sizes = await metrics(page, args);
-  const region = options.rect && Number.isFinite(options.rect.width) ? {
-    x: Math.max(0,Math.round(Number(options.rect.x)||0)),
-    y: Math.max(0,Math.round(Number(options.rect.y)||0)),
+  const viewport = page.viewportSize() || {width: sizes.viewportWidth, height: sizes.viewportHeight};
+  const regionRequested = options.rect && Number.isFinite(Number(options.rect.width)) ? {
+    x: Math.max(0, Math.floor(Number(options.rect.x)||0)),
+    y: Math.max(0, Math.floor(Number(options.rect.y)||0)),
     width: Math.ceil(Number(options.rect.width)),
     height: Math.ceil(Number(options.rect.height)),
   } : null;
+  // 框选使用浏览器可视区坐标，严格限制到可见边界。
+  const region = regionRequested ? {
+    x: Math.min(regionRequested.x, viewport.width - 1),
+    y: Math.min(regionRequested.y, viewport.height - 1),
+    width: Math.min(regionRequested.width, viewport.width - regionRequested.x),
+    height: Math.min(regionRequested.height, viewport.height - regionRequested.y),
+  } : null;
   const full = Boolean(options.fullPage) && !region;
-  const cssWidth = region ? region.width : full ? sizes.scrollWidth : sizes.viewportWidth;
-  const cssHeight = region ? region.height : full ? sizes.scrollHeight : sizes.viewportHeight;
-  if (!Number.isFinite(cssWidth) || !Number.isFinite(cssHeight) || cssWidth < 1 || cssHeight < 1) throw new Error('选区尺寸不正确');
+  const cssWidth = region ? region.width : full ? sizes.scrollWidth : viewport.width;
+  const cssHeight = region ? region.height : full ? sizes.scrollHeight : viewport.height;
+  if (!Number.isFinite(cssWidth) || !Number.isFinite(cssHeight) || cssWidth < 1 || cssHeight < 1)
+    throw new Error('截图区域无效，框选范围必须在浏览器可视区域内');
   guardPixels(cssWidth, cssHeight, args.dpr);
-  const clip = {
-    x: full ? 0 : sizes.scrollX + (region?.x || 0),
-    y: full ? 0 : sizes.scrollY + (region?.y || 0),
-    width: cssWidth, height: cssHeight, scale: args.dpr,
-  };
-  const client = await page.context().newCDPSession(page);
-  try {
-    const res = await client.send('Page.captureScreenshot',{
-      format:'png', fromSurface:true, captureBeyondViewport:full, clip,
-    });
-    const buffer = Buffer.from(res.data,'base64');
-    const pixel = pngSize(buffer);
-    if (pixel.width < Math.floor(cssWidth * args.dpr * .95) || pixel.height < Math.floor(cssHeight * args.dpr * .95)) {
-      console.warn(`注意：实际截图像素 ${pixel.width}×${pixel.height} 低于预期 ${cssWidth*args.dpr}×${cssHeight*args.dpr}。请检查浏览器缩放或截图设置。`);
-    }
-    return {buffer,cssWidth,cssHeight,pixel,full,region,zoom:sizes.zoom};
-  } finally {await client.detach().catch(()=>{});}
+  // 直接使用 Playwright 实际视口截图，以 deviceScaleFactor 输出高清像素，
+  // 避免 CDP clip.scale 扩大画布，产生右侧和底部的大面积空白。
+  const clip = region ? {
+    x: sizes.scrollX + region.x, y: sizes.scrollY + region.y,
+    width: region.width, height: region.height
+  } : undefined;
+  const buffer = await page.screenshot({type:'png', fullPage:full,
+    ...(clip ? {clip} : {}), scale:'device', animations:'disabled', caret:'hide', timeout:60000});
+  const pixel = pngSize(buffer);
+  const expectedW = Math.round(cssWidth * args.dpr), expectedH = Math.round(cssHeight * args.dpr);
+  if (Math.abs(pixel.width-expectedW)>Math.max(4,expectedW*.025) || Math.abs(pixel.height-expectedH)>Math.max(4,expectedH*.025))
+    throw new Error(`截图尺寸异常：实际 ${pixel.width}×${pixel.height}，预期约 ${expectedW}×${expectedH}。已取消保存，避免得到含大面积空白的文件。`);
+  return {buffer,cssWidth,cssHeight,pixel,full,region,zoom:sizes.zoom};
 }
 
 function createName(page, tag, extension) {
@@ -322,8 +334,11 @@ async function runCommand(page,args,mode) {
 }
 
 async function launchBrowser(args,profileDir) {
-  const base={headless:args.headless,locale:'zh-CN',viewport:args.headless?{width:args.width,height:args.height}:null,
-    args:[`--window-size=${args.width},${args.height}`,'--start-maximized']};
+  const base={headless:args.headless,locale:'zh-CN',
+    viewport:{width:args.width,height:args.height},
+    deviceScaleFactor:args.dpr,
+    screen:{width:args.width,height:args.height},
+    args:[`--window-size=${args.width+30},${args.height+110}`]};
   const options=args.browser==='auto'?['chrome','msedge','chromium']:[args.browser];
   const reasons=[];
   for(const channel of options){
@@ -364,18 +379,36 @@ async function main() {
   const ctx=await launchBrowser(args,profileDir);
   let closed=false;
   let active=null;
-  ctx.on('close',()=>{closed=true;process.stdin.pause();console.log('浏览器已关闭，截图助手结束。');});
-  // 在整个 Context 层注入，支持 SPA 导航、刷新、弹出的新标签页。
-  await ctx.exposeBinding('__hdCapture',(source,options)=>capturePage(source.page,args,options||{}));
-  await ctx.exposeBinding('__hdSnapshot',(source,options)=>snapshotPdf(source.page,args,options||{}));
-  await ctx.exposeBinding('__hdVector',(source,options)=>vectorPdf(source.page,args,options||{}));
-  await ctx.addInitScript({content:overlayScript(args.dpr)});
-  ctx.on('page',p=>{active=p;p.on('domcontentloaded',()=>{active=p;p.evaluate(overlayScript(args.dpr)).catch(()=>{})});});
-  const page=ctx.pages()[0]||await ctx.newPage();active=page;
+  let markClosed;
+  const closedPromise = new Promise(resolve => {markClosed=resolve;});
+  ctx.once('close',()=>{closed=true;markClosed();process.stdin.pause();console.log('浏览器已关闭，截图助手结束。');});
+  const token = crypto.randomBytes(24).toString('hex');
+  const busyPages = new WeakSet();
+  const exclusive = async (page, options, fn) => {
+    if (options?.__hdToken !== token) throw new Error('禁止网页脚本直接请求截图，请使用截图工具栏');
+    if (busyPages.has(page)) throw new Error('当前截图还在导出中，请稍后再试');
+    busyPages.add(page);
+    try {return await fn();} finally {busyPages.delete(page);}
+  };
+  await ctx.exposeBinding('__hdCapture',(source,opts)=>exclusive(source.page,opts,()=>capturePage(source.page,args,opts||{})));
+  await ctx.exposeBinding('__hdSnapshot',(source,opts)=>exclusive(source.page,opts,()=>snapshotPdf(source.page,args,opts||{})));
+  await ctx.exposeBinding('__hdVector',(source,opts)=>exclusive(source.page,opts,()=>vectorPdf(source.page,args,opts||{})));
+  const barScript = overlayScript(args.dpr,token);
+  await ctx.addInitScript({content:barScript});
+  const attached = new WeakSet();
+  const attach = (p) => {
+    if (attached.has(p)) return;
+    attached.add(p);
+    active=p;
+    p.on('domcontentloaded',()=>{active=p;p.evaluate(barScript).catch(()=>{});});
+  };
+  ctx.on('page',attach);
+  for (const p of ctx.pages()) attach(p);
+  const page=ctx.pages()[0]||await ctx.newPage();attach(page);
   try{
     await page.goto(args.url,{waitUntil:'domcontentloaded',timeout:45000});
     await page.waitForTimeout(500);
-    await page.evaluate(overlayScript(args.dpr)).catch(()=>{});
+    await page.evaluate(barScript).catch(()=>{});
     console.log(`成功打开：${page.url()}`);
   }catch(e){
     if(temporary){await ctx.close().catch(()=>{}); throw new Error('目标网页未能成功加载，已取消自动截图：'+e.message);}
@@ -391,9 +424,9 @@ async function main() {
   console.log('终端命令：回车 截当前屏；p 快照PDF；pv 打印PDF；f 整页；b PNG+PDF。');
   console.log('支持浏览器内导航到任何其他网址，关闭浏览器即可结束。\n');
   if(process.stdin.isTTY){
-    process.stdin.resume();process.stdin.setEncoding('utf8');
+    const commandInput = readline.createInterface({input:process.stdin,terminal:false});
     let queue=Promise.resolve();
-    process.stdin.on('data',input=>{
+    commandInput.on('line',input=>{
       queue=queue.then(async()=>{
         if(closed)return;
         const target=(active&&!active.isClosed()?active:ctx.pages().find(p=>!p.isClosed()));
@@ -402,7 +435,7 @@ async function main() {
       });
     });
   }
-  await new Promise(resolve=>ctx.once('close',resolve));
+  await closedPromise;
 }
 
 if(require.main===module){main().catch(e=>{console.error('\n错误：'+(e.stack||e.message));process.exitCode=1;});}
