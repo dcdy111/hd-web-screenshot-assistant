@@ -314,8 +314,21 @@ async function metrics(page, args) {
 function guardPixels(cssW, cssH, scale) {
   const w = Math.ceil(cssW * scale), h = Math.ceil(cssH * scale);
   if (w * h > MAX_PIXELS || w > 32000 || h > 32000) {
-    throw new Error(`截图过大：预计 ${w}×${h} 像素。请改用“框选PNG”、当前屏截图，或降低 --dpr 值`);
+    throw new Error(`截图区域超过安全像素上限：${w}×${h}；建议使用框选或分段导出`);
   }
+}
+
+// 高清倍率是期望值而非强制值：显示器可视区尺寸越大，安全倍率可能越低。
+// 例如 2560×1305 在 ×4 下超出 4500 万像素，自动降到 ×3，而不是导出失败。
+function chooseCaptureDpr(cssW, cssH, preferred, maxPixels=MAX_PIXELS) {
+  if (![cssW,cssH,preferred,maxPixels].every(x=>Number.isFinite(x)&&x>0)) return 0;
+  const cap = Math.min(
+    preferred,
+    Math.floor(Math.sqrt(maxPixels / (cssW * cssH))),
+    Math.floor(32000 / cssW),
+    Math.floor(32000 / cssH),
+  );
+  return Math.max(0,cap);
 }
 
 function overlayScript(dpr, secret = '') {
@@ -334,7 +347,10 @@ function overlayScript(dpr, secret = '') {
       const b=document.createElement('button');b.type='button';b.textContent=name;b.title=title||name;
       b.style.cssText='background:#1659c5;border:0;color:white;border-radius:7px;padding:7px 9px;font:12px system-ui;cursor:pointer';
       b.addEventListener('click',async(e)=>{e.preventDefault();e.stopPropagation();b.disabled=true;const old=b.textContent;b.textContent='保存中';
-        try {const r=await act(); status.textContent='已保存：'+(r.filePath||r.companionPngPath||'完成');b.textContent='完成';}
+        try {const r=await act(); status.textContent=(r.filePaths?.length>1?'已保存 '+r.filePaths.length+' 张：':'已保存：')+
+          (r.filePath||r.companionPngPath||'完成')+
+          (r.effectiveDpr&&r.effectiveDpr!==${dpr}?' · 自动调整为 ×'+r.effectiveDpr:'');
+        b.textContent='完成';}
         catch(err){status.textContent='失败：'+err.message;b.textContent='失败';console.error(err);}
         setTimeout(()=>{b.textContent=old;b.disabled=false},1400);
       });root.append(b);return b;
@@ -508,20 +524,21 @@ async function captureBuffer(page, args, options={}) {
     width: Math.min(regionRequested.width, viewport.width - regionRequested.x),
     height: Math.min(regionRequested.height, viewport.height - regionRequested.y),
   } : null;
-  const full = Boolean(options.fullPage) && !region;
-  const startX = full ? 0 : sizes.scrollX + (region ? region.x : 0);
-  const startY = full ? 0 : sizes.scrollY + (region ? region.y : 0);
-  // 只有整页/当前屏允许自动裁边；用户框选必须严格保持选区尺寸。
-  const canTrim = !region && (full || sizes.hasContentSurface);
-  const requestedWidth = region ? region.width : full ? sizes.scrollWidth : viewport.width;
-  const requestedHeight = region ? region.height : full ? sizes.scrollHeight : viewport.height;
+  const docRect=options.documentRect||null; // 内部使用：超长页面分段截图，文档坐标
+  const full = Boolean(options.fullPage) && !region && !docRect;
+  const startX = docRect ? docRect.x : full ? 0 : sizes.scrollX + (region ? region.x : 0);
+  const startY = docRect ? docRect.y : full ? 0 : sizes.scrollY + (region ? region.y : 0);
+  // 只有整页/当前屏允许自动裁边；框选与内部文档分段保留精确矩形。
+  const canTrim = !region && !docRect && (full || sizes.hasContentSurface);
+  const requestedWidth = docRect ? docRect.width : region ? region.width : full ? sizes.scrollWidth : viewport.width;
+  const requestedHeight = docRect ? docRect.height : region ? region.height : full ? sizes.scrollHeight : viewport.height;
   let cssWidth = canTrim && sizes.contentWidth > startX
     ? Math.min(requestedWidth, sizes.contentWidth - startX) : requestedWidth;
   let cssHeight = canTrim && sizes.contentHeight > startY
     ? Math.min(requestedHeight, sizes.contentHeight - startY) : requestedHeight;
   // 普通当前屏进一步排除网站未使用的纯色边缘。
   // 框选按用户坐标原样输出；整页仍以页面/DOM边界为准。
-  if (!region && !full) {
+  if (!region && !full && !docRect) {
     const pixels = await renderedContentBounds(page);
     if (pixels) {
       const scaleX=viewport.width/pixels.width,scaleY=viewport.height/pixels.height;
@@ -532,7 +549,9 @@ async function captureBuffer(page, args, options={}) {
   }
   if (!Number.isFinite(cssWidth) || !Number.isFinite(cssHeight) || cssWidth < 1 || cssHeight < 1)
     throw new Error('截图区域无效，框选范围必须在浏览器可视区域内');
-  guardPixels(cssWidth, cssHeight, args.dpr);
+  const effectiveDpr=chooseCaptureDpr(cssWidth,cssHeight,args.dpr);
+  if(effectiveDpr<1) throw new Error('页面尺寸过大，无法单张保存；请使用整页PNG分段导出或框选PNG');
+  guardPixels(cssWidth, cssHeight, effectiveDpr);
   // The interactive browser uses the monitor's real viewport (viewport:null).
   // CDP applies the requested export scale to that viewport without resizing the
   // visible window. CDP clip coordinates are document coordinates, so a region
@@ -558,7 +577,7 @@ async function captureBuffer(page, args, options={}) {
     const probePixel = pngSize(Buffer.from(probe.data, 'base64'));
     const surfaceScale = (probePixel.width/probeWidth + probePixel.height/probeHeight)/2;
     if (!Number.isFinite(surfaceScale) || surfaceScale <= 0) throw new Error('无法校准浏览器截图倍率');
-    const captureScale = args.dpr / surfaceScale;
+    const captureScale = effectiveDpr / surfaceScale;
     const shot = await client.send('Page.captureScreenshot', {
       format:'png', fromSurface:true, captureBeyondViewport:true,
       clip:{...clip, scale:captureScale}
@@ -566,10 +585,10 @@ async function captureBuffer(page, args, options={}) {
     buffer = Buffer.from(shot.data, 'base64');
   } finally { await client.detach().catch(()=>{}); }
   const pixel = pngSize(buffer);
-  const expectedW = Math.round(cssWidth * args.dpr), expectedH = Math.round(cssHeight * args.dpr);
+  const expectedW = Math.round(cssWidth * effectiveDpr), expectedH = Math.round(cssHeight * effectiveDpr);
   if (Math.abs(pixel.width-expectedW)>Math.max(4,expectedW*.025) || Math.abs(pixel.height-expectedH)>Math.max(4,expectedH*.025))
     throw new Error(`截图尺寸异常：实际 ${pixel.width}×${pixel.height}，预期约 ${expectedW}×${expectedH}。已取消保存，避免得到含大面积空白的文件。`);
-  return {buffer,cssWidth,cssHeight,pixel,full,region,zoom:sizes.zoom};
+  return {buffer,cssWidth,cssHeight,pixel,full,region,zoom:sizes.zoom,effectiveDpr};
 }
 
 function createName(page, tag, extension) {
@@ -578,12 +597,42 @@ function createName(page, tag, extension) {
 
 async function capturePage(page,args,options={}) {
   fs.mkdirSync(args.outDir,{recursive:true});
+  // 超长页面单张图片即使降低到 ×1 仍会占用过多内存。
+  // 此时自动按文档坐标分段保存多个高清 PNG，不失败、不改变浏览器窗口。
+  if(options.fullPage && !options.rect){
+    const size=await metrics(page,args);
+    const pageWidth=Math.max(1,Math.min(size.scrollWidth,size.contentWidth||size.scrollWidth));
+    const pageHeight=Math.max(1,Math.min(size.scrollHeight,size.contentHeight||size.scrollHeight));
+    const wholeScale=chooseCaptureDpr(pageWidth,pageHeight,args.dpr);
+    if(wholeScale<Math.min(2,args.dpr)){
+      const partScale=Math.min(args.dpr,2,Math.floor(32000/pageWidth));
+      if(partScale<1) throw new Error('网页过宽，无法安全导出；请调整网页缩放或框选');
+      const partHeight=Math.floor(MAX_PIXELS*0.75/(pageWidth*partScale*partScale));
+      if(partHeight<100) throw new Error('网页过宽，无法分段导出；请调整网页缩放');
+      const parts=Math.ceil(pageHeight/partHeight);
+      if(parts>100) throw new Error('网页过长，需要超过100个分段，请分批截图');
+      const filePaths=[];
+      for(let i=0;i<parts;i++){
+        const y=i*partHeight;
+        const partArgs={...args,dpr:partScale};
+        const shot=await hiddenToolbar(page,()=>captureBuffer(page,partArgs,{
+          documentRect:{x:0,y,width:pageWidth,height:Math.min(partHeight,pageHeight-y)}
+        }));
+        const filePath=path.join(args.outDir,createName(page,
+          `full-part-${String(i+1).padStart(3,'0')}-of-${String(parts).padStart(3,'0')}-${shot.pixel.width}x${shot.pixel.height}`,'png'));
+        fs.writeFileSync(filePath,shot.buffer);
+        filePaths.push(filePath);
+        console.log(`[整页PNG ${i+1}/${parts}] ${filePath}`);
+      }
+      return {filePath:filePaths[0],filePaths,effectiveDpr:partScale,segments:parts};
+    }
+  }
   const shot = await hiddenToolbar(page,()=>captureBuffer(page,args,options));
   const type = shot.region ? 'region' : shot.full ? 'full' : 'viewport';
   const filePath=path.join(args.outDir,createName(page,`${type}-${shot.pixel.width}x${shot.pixel.height}`, 'png'));
   fs.writeFileSync(filePath, shot.buffer);
-  console.log(`\n[PNG 已保存] ${filePath}\n原始截图像素：${shot.pixel.width}×${shot.pixel.height}`);
-  return {filePath,actualWidth:shot.pixel.width,actualHeight:shot.pixel.height};
+  console.log(`\n[PNG 已保存] ${filePath}\n原始截图像素：${shot.pixel.width}×${shot.pixel.height}，实际高清倍率 ×${shot.effectiveDpr}`);
+  return {filePath,actualWidth:shot.pixel.width,actualHeight:shot.pixel.height,effectiveDpr:shot.effectiveDpr};
 }
 
 async function snapshotPdf(page,args,options={}) {
@@ -610,7 +659,7 @@ async function snapshotPdf(page,args,options={}) {
     await temp.pdf({path:base,printBackground:true,preferCSSPageSize:true,margin:{top:0,bottom:0,left:0,right:0}});
   } finally {await temp.close().catch(()=>{});}
   console.log(`\n[快照 PDF 已保存] ${base}\n[同内容 PNG] ${companionPngPath}`);
-  return {filePath:base,companionPngPath,toolbarExcluded:true};
+  return {filePath:base,companionPngPath,toolbarExcluded:true,effectiveDpr:shot.effectiveDpr};
 }
 
 async function vectorPdf(page,args,options={}) {
@@ -703,6 +752,10 @@ async function main() {
     assert.throws(()=>normalizeUrl('file:///C:/passwords.txt'));
     guardPixels(800,600,4);
     assert.throws(()=>guardPixels(10000,10000,4));
+    assert.strictEqual(chooseCaptureDpr(2560,1305,4),3);
+    assert.strictEqual(chooseCaptureDpr(2560,1412,4),3);
+    assert.strictEqual(chooseCaptureDpr(640,480,4),4);
+    assert.strictEqual(chooseCaptureDpr(2560,30000,4),0);
     console.log('参数、网址处理与像素限额单元测试通过。');return;
   }
   args.url=await obtainUrl(args);
@@ -773,4 +826,4 @@ async function main() {
 }
 
 if(require.main===module){main().catch(e=>{console.error('\n错误：'+(e.stack||e.message));process.exitCode=1;});}
-module.exports={normalizeUrl,parseArgs,safeName,guardPixels,overlayScript,captureBuffer,capturePage,snapshotPdf,vectorPdf};
+module.exports={normalizeUrl,parseArgs,safeName,guardPixels,chooseCaptureDpr,overlayScript,captureBuffer,capturePage,snapshotPdf,vectorPdf};
