@@ -567,6 +567,29 @@ async function playwrightReference(page, {x=0,y=0,width,height,full=false,viewpo
     throw new Error('Chrome 可见画面超出内存安全上限，请缩小当前浏览器窗口');
   const viewW=viewportWidth||await page.evaluate(()=>window.innerWidth);
   const viewH=viewportHeight||await page.evaluate(()=>window.innerHeight);
+  if(scale==='device'){
+    // 高清候选必须在“整个可见画面”层面先与 Chrome 原始渲染对齐，
+    // 不能先 CDP.clip 再检查；缩放改变时也不缓存旧倍率。
+    const realDpr=await page.evaluate(()=>window.devicePixelRatio).catch(()=>1);
+    const expectedW=Math.round(viewW*realDpr);
+    const expectedH=Math.round(viewH*realDpr);
+    if(expectedW*expectedH<=MAX_PIXELS&&expectedW<=32000&&expectedH<=32000) {
+      try {
+        const candidate=await page.screenshot({
+          type:'png',fullPage:false,scale:'device',
+          animations:'disabled',caret:'hide',timeout:60000
+        });
+        const high=pngSize(candidate);
+        const correctSize=Math.abs(high.width-expectedW)<=Math.max(3,expectedW*.025)
+          &&Math.abs(high.height-expectedH)<=Math.max(3,expectedH*.025);
+        const aligned=correctSize&&await compareRenderedImages(page,viewportPng,candidate);
+        if(aligned) viewportPng=candidate;
+        else console.warn('[缩放对齐保护] 高清候选与浏览器可见画面不一致，使用原始渲染图');
+      } catch(error) {
+        console.warn('[缩放对齐保护] 高清截图未通过校验，使用原始渲染图：'+error.message);
+      }
+    }
+  }
   // 视口全图时无需重新编码，最大程度保留原始浏览器输出。
   if(x===0 && y===0 && Math.abs(width-viewW)<1 && Math.abs(height-viewH)<1)
     return viewportPng;
