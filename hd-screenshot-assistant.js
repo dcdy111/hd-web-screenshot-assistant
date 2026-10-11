@@ -550,9 +550,21 @@ async function compareRenderedImages(page, baseline, candidate) {
 async function playwrightReference(page, {x=0,y=0,width,height,full=false,viewportWidth,viewportHeight}, scale='css') {
   if(full) return page.screenshot({type:'png',fullPage:true,scale,
     animations:'disabled',caret:'hide',timeout:60000});
-  const viewportPng=await page.screenshot({type:'png',fullPage:false,scale,
-    animations:'disabled',caret:'hide',timeout:60000});
+  // 不使用 Playwright 自动处理的 clip/scale 参数，直接读取当前 Chrome
+  // 原生合成表面：页面 80%/125%/150% 缩放由浏览器自行处理。
+  // captureBeyondViewport:false 只输出眼睛当前看到的页面，避免文档越界。
+  const client=await page.context().newCDPSession(page);
+  let viewportPng;
+  try {
+    const shot=await client.send('Page.captureScreenshot',{
+      format:'png',fromSurface:true,captureBeyondViewport:false
+    });
+    viewportPng=Buffer.from(shot.data,'base64');
+  } finally {await client.detach().catch(()=>{});}
   const imageSize=pngSize(viewportPng);
+  if(imageSize.width>32000||imageSize.height>32000||
+      imageSize.width*imageSize.height>MAX_PIXELS)
+    throw new Error('Chrome 可见画面超出内存安全上限，请缩小当前浏览器窗口');
   const viewW=viewportWidth||await page.evaluate(()=>window.innerWidth);
   const viewH=viewportHeight||await page.evaluate(()=>window.innerHeight);
   // 视口全图时无需重新编码，最大程度保留原始浏览器输出。
