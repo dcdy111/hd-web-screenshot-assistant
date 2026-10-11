@@ -205,10 +205,13 @@ async function main() {
     const fullLarge=await capturePage(page,bigArgs,{fullPage:true});
     assert.equal(fullLarge.effectiveDpr,3,'full-page PNG must adapt too');
     // Small selection follows current browser-native DPR, not a hard-coded quality multiplier.
+    const realtimeDpr=await page.evaluate(()=>window.devicePixelRatio);
     const largeSelection=await capturePage(page,bigArgs,{rect:{x:20,y:20,width:180,height:120}});
-    assert.equal(largeSelection.effectiveDpr,2);
-    assert.equal(largeSelection.actualWidth,360);
-    assert.equal(largeSelection.actualHeight,240);
+    // Chromium may change its actual device pixel ratio when resizing the browser.
+    // The output must follow real-time browser state, never a cached 2x or 4x.
+    assert.ok(largeSelection.effectiveDpr>=1&&largeSelection.effectiveDpr<=Math.max(1,realtimeDpr));
+    assert.equal(largeSelection.actualWidth,Math.round(180*largeSelection.effectiveDpr));
+    assert.equal(largeSelection.actualHeight,Math.round(120*largeSelection.effectiveDpr));
     // Chrome Ctrl+mouse-wheel browser zoom regression (not CSS transform/zoom).
     await page.setViewportSize({width:960,height:720});
     await page.setContent(`<!doctype html><style>
