@@ -341,7 +341,7 @@ function overlayScript(dpr, secret = '') {
     const invoke = (which, opts = {}) => handlers[which]({...opts, __hdToken: trustedToken});
     const root = document.createElement('div'); root.id='hd-assistant-root';
     root.style.cssText='position:fixed;top:66px;right:16px;z-index:2147483647;max-width:370px;background:rgba(255,255,255,.97);padding:8px;border:1px solid #94a3b8;border-radius:12px;box-shadow:0 10px 28px #0003;display:flex;gap:5px;flex-wrap:wrap;align-items:center;font:13px system-ui,sans-serif;color:#0f172a';
-    const label=document.createElement('span');label.textContent='截图 HD ×${dpr}';label.style.cssText='font-weight:700;padding:5px';root.append(label);
+    const label=document.createElement('span');label.textContent='截图 · 自适应';label.style.cssText='font-weight:700;padding:5px';root.append(label);
     const status=document.createElement('span');status.style.cssText='width:100%;font:11px system-ui;color:#64748b';status.textContent='截图自动隐藏工具条 · 文件保存到 output 目录';
     const makeBtn=(name, act, title)=>{
       const b=document.createElement('button');b.type='button';b.textContent=name;b.title=title||name;
@@ -349,7 +349,7 @@ function overlayScript(dpr, secret = '') {
       b.addEventListener('click',async(e)=>{e.preventDefault();e.stopPropagation();b.disabled=true;const old=b.textContent;b.textContent='保存中';
         try {const r=await act(); status.textContent=(r.filePaths?.length>1?'已保存 '+r.filePaths.length+' 张：':'已保存：')+
           (r.filePath||r.companionPngPath||'完成')+
-          (r.effectiveDpr&&r.effectiveDpr!==${dpr}?' · 自动调整为 ×'+r.effectiveDpr:'');
+          (r.effectiveDpr?' · 实际输出倍率 ×'+r.effectiveDpr:'');
         b.textContent='完成';}
         catch(err){status.textContent='失败：'+err.message;b.textContent='失败';console.error(err);}
         setTimeout(()=>{b.textContent=old;b.disabled=false},1400);
@@ -372,9 +372,9 @@ function overlayScript(dpr, secret = '') {
         if(rect.width<20||rect.height<20)reject(new Error('选区太小'));else resolve(rect);
       });
     });
-    makeBtn('当前屏PNG',()=>invoke('capture', {}),'最适合Word和PPT');
-    makeBtn('框选PNG',async()=>invoke('capture', {rect:await selectRect()}),'截取局部，保持真实像素');
-    makeBtn('整页PNG',()=>invoke('capture', {fullPage:true}),'过长页面建议降低DPR');
+    makeBtn('当前屏PNG',()=>invoke('capture', {}),'截取当前浏览器实际可见画面，按实时倍率输出');
+    makeBtn('框选PNG',async()=>invoke('capture', {rect:await selectRect()}),'按拖选范围，从浏览器真实可见画面裁剪，不使用固定倍率');
+    makeBtn('整页PNG',()=>invoke('capture', {fullPage:true}),'整页按安全倍率输出，过长页面自动分段');
     makeBtn('当前屏PDF',()=>invoke('snapshot', {}),'嵌入PNG的视觉快照PDF');
     makeBtn('框选PDF',async()=>invoke('snapshot', {rect:await selectRect()}),'嵌入高清截图的局部PDF');
     makeBtn('打印PDF',()=>invoke('vector', {fullPage:true}),'尽量保留网页文字矢量属性；排版可能变化');
