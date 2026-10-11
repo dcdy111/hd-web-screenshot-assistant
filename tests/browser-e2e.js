@@ -108,8 +108,8 @@ async function main() {
     assert.deepEqual([trimmedFull.cssWidth,trimmedFull.cssHeight],[538,398],
       'full-page capture must crop viewport-sized blank space to the painted content edge');
     const trimmedViewport=await captureBuffer(page,args);
-    assert.ok(trimmedViewport.cssWidth>=522 && trimmedViewport.cssWidth<=538 && trimmedViewport.cssHeight>=382 && trimmedViewport.cssHeight<=398,
-      'viewport capture must trim unused right and bottom margins when a bounded page surface exists');
+    assert.deepEqual([trimmedViewport.cssWidth,trimmedViewport.cssHeight],[640,480],
+      'current-screen native capture must reflect exactly the visible browser viewport');
     const trimmedRegion=await captureBuffer(page,args,{rect:{x:20,y:20,width:600,height:440}});
     assert.deepEqual([trimmedRegion.cssWidth,trimmedRegion.cssHeight],[600,440],
       'user-selected region must keep its exact dimensions even when blank background is inside selection');
@@ -123,8 +123,8 @@ async function main() {
     await page.evaluate(()=>window.scrollTo(0,0));
     await page.waitForFunction(()=>window.scrollX===0&&window.scrollY===0);
     const fixedShell=await captureBuffer(page,args);
-    assert.ok(fixedShell.cssWidth>=522 && fixedShell.cssWidth<=538 && fixedShell.cssHeight>=382 && fixedShell.cssHeight<=398,
-      'a fixed application shell must not prevent trimming its bounded page content');
+    assert.deepEqual([fixedShell.cssWidth,fixedShell.cssHeight],[640,480],
+      'fixed shells must be captured as actually visible; precise trimming is the user-selected mode');
 
     await page.setContent('<iframe id="content-frame"></iframe>');
     await page.locator('#content-frame').evaluate(frame=>{
@@ -133,8 +133,8 @@ async function main() {
     });
     await page.frameLocator('#content-frame').locator('.page').waitFor();
     const iframeContent=await captureBuffer(page,args);
-    assert.ok(iframeContent.cssWidth>=522 && iframeContent.cssWidth<=538 && iframeContent.cssHeight>=382 && iframeContent.cssHeight<=398,
-      'a full-window iframe must be cropped to the embedded page content bounds');
+    assert.deepEqual([iframeContent.cssWidth,iframeContent.cssHeight],[640,480],
+      'visible iframe content must remain in the exact current viewport without CDP offsets');
 
     // Regression for the reported multi-monitor screenshot: the DOM's
     // nearly-transparent full-size shell reaches the viewport edge, but the
@@ -147,12 +147,10 @@ async function main() {
         background:#fff;border:2px solid #254269}
     </style><div class="phantom"></div><main class="app"><h1>Working dashboard</h1><p>Trim empty background, not the visible application.</p></main>`);
     const noBlank=await captureBuffer(page,args);
-    assert.ok(noBlank.cssWidth>=498 && noBlank.cssWidth<=532,
-      'a barely visible full-size DOM shell must not keep the empty right margin');
-    assert.ok(noBlank.cssHeight>=368 && noBlank.cssHeight<=402,
-      'a barely visible full-size DOM shell must not keep the empty bottom margin');
-    assert.ok(noBlank.pixel.width>=996&&noBlank.pixel.width<=1064,
-      'trimmed screenshot must retain the expected high-resolution pixel scale');
+    assert.deepEqual([noBlank.cssWidth,noBlank.cssHeight],[640,480],
+      'native current screen preserves the real viewport rather than heuristically cropping');
+    assert.equal(noBlank.pixel.width,1280,
+      'actual browser device pixels are used without fabricated upscale');
 
     await page.setContent('<html><style>html,body{margin:0;background:#f94;height:100%}</style><body>Continuous screenshot regression</body></html>');
     await page.evaluate(overlayScript(2,token));
@@ -196,23 +194,21 @@ async function main() {
     </style><main class="content">Large monitor screenshot <span class="corner">edge</span></main>`);
     const bigArgs={...args,dpr:4,width:2560,height:1305};
     const large=await capturePage(page,bigArgs);
-    assert.equal(large.effectiveDpr,3,'4x should safely adapt to 3x on 2560x1305 viewport');
-    assert.ok(large.actualWidth>=7500&&large.actualWidth<=7680,
-      'large monitor screenshot must keep correct viewport width without expanding');
-    assert.ok(large.actualHeight>=3850&&large.actualHeight<=3915,
-      'large monitor screenshot must keep correct viewport height without expanding');
+    assert.equal(large.effectiveDpr,2,'visible screen must use real Chrome 2x device pixel scale, not configured 4x');
+    assert.equal(large.actualWidth,5120,'large monitor native screenshot must match actual browser pixels');
+    assert.equal(large.actualHeight,2610,'large monitor native screenshot must match actual browser pixels');
     assert.ok(fs.statSync(large.filePath).size>1000,'PNG must be physically saved');
     const largePdf=await snapshotPdf(page,bigArgs);
-    assert.equal(largePdf.effectiveDpr,3,'large screen snapshot PDF must share adaptive DPR');
+    assert.equal(largePdf.effectiveDpr,2,'large screen snapshot PDF must share browser-native DPR');
     assert.equal(fs.readFileSync(largePdf.filePath).subarray(0,4).toString(),'%PDF',
       'large screen PDF must be valid instead of failing on a pixel limit');
     const fullLarge=await capturePage(page,bigArgs,{fullPage:true});
     assert.equal(fullLarge.effectiveDpr,3,'full-page PNG must adapt too');
-    // Default small selections continue to be full ×4, even after a large capture.
+    // Small selection follows current browser-native DPR, not a hard-coded quality multiplier.
     const largeSelection=await capturePage(page,bigArgs,{rect:{x:20,y:20,width:180,height:120}});
-    assert.equal(largeSelection.effectiveDpr,4);
-    assert.equal(largeSelection.actualWidth,720);
-    assert.equal(largeSelection.actualHeight,480);
+    assert.equal(largeSelection.effectiveDpr,2);
+    assert.equal(largeSelection.actualWidth,360);
+    assert.equal(largeSelection.actualHeight,240);
     // Chrome Ctrl+mouse-wheel browser zoom regression (not CSS transform/zoom).
     await page.setViewportSize({width:960,height:720});
     await page.setContent(`<!doctype html><style>
