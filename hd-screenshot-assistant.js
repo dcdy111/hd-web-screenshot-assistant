@@ -544,10 +544,34 @@ async function compareRenderedImages(page, baseline, candidate) {
   },{baseline:baseline.toString('base64'),candidate:candidate.toString('base64')});
 }
 
-async function playwrightReference(page, {x,y,width,height,full=false}, scale='css') {
-  const clip=full?undefined:{x,y,width,height};
-  return page.screenshot({type:'png',fullPage:full,scale,
-    ...(clip?{clip}:{}),animations:'disabled',caret:'hide',timeout:60000});
+// 原生浏览器画面必须先截取整个可视区，再用 clientX/clientY 坐标裁剪。
+// page.screenshot({clip}) 在存在文档滚动或 Chrome 页面缩放时可能被解释成文档坐标，
+// 直接用它会让原生回退截图裁到错误位置。
+async function playwrightReference(page, {x=0,y=0,width,height,full=false,viewportWidth,viewportHeight}, scale='css') {
+  if(full) return page.screenshot({type:'png',fullPage:true,scale,
+    animations:'disabled',caret:'hide',timeout:60000});
+  const viewportPng=await page.screenshot({type:'png',fullPage:false,scale,
+    animations:'disabled',caret:'hide',timeout:60000});
+  const imageSize=pngSize(viewportPng);
+  const viewW=viewportWidth||await page.evaluate(()=>window.innerWidth);
+  const viewH=viewportHeight||await page.evaluate(()=>window.innerHeight);
+  // 视口全图时无需重新编码，最大程度保留原始浏览器输出。
+  if(x===0 && y===0 && Math.abs(width-viewW)<1 && Math.abs(height-viewH)<1)
+    return viewportPng;
+  const result=await page.evaluate(async ({data,x,y,width,height,viewW,viewH})=>{
+    const img=new Image();
+    img.src='data:image/png;base64,'+data;
+    await img.decode();
+    const sx=img.naturalWidth/viewW,sy=img.naturalHeight/viewH;
+    const canvas=document.createElement('canvas');
+    canvas.width=Math.max(1,Math.round(width*sx));
+    canvas.height=Math.max(1,Math.round(height*sy));
+    const ctx=canvas.getContext('2d');
+    if(!ctx)throw new Error('截图回退裁剪画布不可用');
+    ctx.drawImage(img,x*sx,y*sy,width*sx,height*sy,0,0,canvas.width,canvas.height);
+    return canvas.toDataURL('image/png').split(',')[1];
+  },{data:viewportPng.toString('base64'),x,y,width,height,viewW,viewH});
+  return Buffer.from(result,'base64');
 }
 
 async function captureBuffer(page, args, options={}) {
@@ -640,7 +664,8 @@ async function captureBuffer(page, args, options={}) {
   // 普通当前屏与框选必须与浏览器真实可见内容相符，不能只检查 PNG 尺寸。
   // 长页面分段模式沿用单独的整页坐标处理，不做额外大图解码。
   if(!full && !docRect){
-    const referenceOptions={x:startX,y:startY,width:cssWidth,height:cssHeight};
+    const referenceOptions={x:region?region.x:0,y:region?region.y:0,
+      width:cssWidth,height:cssHeight,viewportWidth:viewport.width,viewportHeight:viewport.height};
     let reference=null;
     try{reference=await playwrightReference(page,referenceOptions,'css');}
     catch(err){console.warn('截图参考帧不可用，使用原生浏览器截图：'+err.message);}
