@@ -596,11 +596,9 @@ async function captureBuffer(page, args, options={}) {
   const full = Boolean(options.fullPage) && !region && !docRect;
   const startX = docRect ? docRect.x : full ? 0 : sizes.scrollX + (region ? region.x : 0);
   const startY = docRect ? docRect.y : full ? 0 : sizes.scrollY + (region ? region.y : 0);
-  // Ctrl+滚轮缩放后网页重排，DOM边界和像素裁边可能还在过渡中。
-  // 在动态缩放状态下优先保留完整可见区域，防止裁掉导航栏或内容。
-  const zoomChanged = Number.isFinite(args.initialBrowserDpr) &&
-    Math.abs((await page.evaluate(()=>window.devicePixelRatio))-args.initialBrowserDpr)>0.025;
-  const canTrim = !region && !docRect && (full || (!zoomChanged && sizes.hasContentSurface));
+  // 窗口内容与手动选区始终以浏览器原生视口截图为准，不能让 DOM
+  // 自动裁边改变鼠标选区。只有整页模式使用文档内容边界。
+  const canTrim = !region && !docRect && full;
   const requestedWidth = docRect ? docRect.width : region ? region.width : full ? sizes.scrollWidth : viewport.width;
   const requestedHeight = docRect ? docRect.height : region ? region.height : full ? sizes.scrollHeight : viewport.height;
   let cssWidth = canTrim && sizes.contentWidth > startX
@@ -609,24 +607,38 @@ async function captureBuffer(page, args, options={}) {
     ? Math.min(requestedHeight, sizes.contentHeight - startY) : requestedHeight;
   // 普通当前屏进一步排除网站未使用的纯色边缘。
   // 框选按用户坐标原样输出；整页仍以页面/DOM边界为准。
-  if (!region && !full && !docRect && !zoomChanged) {
-    const pixels = await renderedContentBounds(page);
-    if (pixels) {
-      const scaleX=viewport.width/pixels.width,scaleY=viewport.height/pixels.height;
-      const trimW=Math.ceil(pixels.right*scaleX),trimH=Math.ceil(pixels.bottom*scaleY);
-      cssWidth=Math.min(cssWidth,trimW);
-      cssHeight=Math.min(cssHeight,trimH);
-    }
-  }
   if (!Number.isFinite(cssWidth) || !Number.isFinite(cssHeight) || cssWidth < 1 || cssHeight < 1)
     throw new Error('截图区域无效，框选范围必须在浏览器可视区域内');
+
+  // 每一次都读取 Chrome 当前缩放产生的实时 DPR，不缓存初始缩放，
+  // 不使用 CDP 的 clip.scale：框选 PNG/PDF 与当前屏优先保证原生画面位置。
+  // Playwright 先截真实可见视口，再按鼠标 clientX/clientY 裁剪原始像素。
+  if (!full && !docRect) {
+    const browserDpr=await page.evaluate(()=>window.devicePixelRatio).catch(()=>1);
+    const estimatedPixels=viewport.width*viewport.height*browserDpr*browserDpr;
+    const scale=estimatedPixels<=MAX_PIXELS && viewport.width*browserDpr<=32000 &&
+      viewport.height*browserDpr<=32000 ? 'device' : 'css';
+    const buffer=await playwrightReference(page,{
+      x:region?region.x:0,y:region?region.y:0,
+      width:cssWidth,height:cssHeight,
+      viewportWidth:viewport.width,viewportHeight:viewport.height
+    },scale);
+    const pixel=pngSize(buffer);
+    const effectiveDpr=Math.round(pixel.width/cssWidth*100)/100;
+    if (pixel.width*pixel.height>MAX_PIXELS||pixel.width>32000||pixel.height>32000)
+      throw new Error('截图实际像素超出安全范围，请缩小框选范围');
+    console.log(`[浏览器原生画面] 当前 Chrome DPR=${Number(browserDpr).toFixed(2)}；`+
+      `截图像素=${pixel.width}×${pixel.height}；实时输出倍率≈×${effectiveDpr}`+
+      (scale==='css'?'（视口过大，已安全降级）':''));
+    return {buffer,cssWidth,cssHeight,pixel,full,region,zoom:sizes.zoom,
+      effectiveDpr,captureMethod:'playwright-native-'+scale};
+  }
+
   const effectiveDpr=chooseCaptureDpr(cssWidth,cssHeight,args.dpr);
   if(effectiveDpr<1) throw new Error('页面尺寸过大，无法单张保存；请使用整页PNG分段导出或框选PNG');
   guardPixels(cssWidth, cssHeight, effectiveDpr);
-  // The interactive browser uses the monitor's real viewport (viewport:null).
-  // CDP applies the requested export scale to that viewport without resizing the
-  // visible window. CDP clip coordinates are document coordinates, so a region
-  // selected with clientX/clientY must include the current scroll offset.
+  // 只有整页 / 长网页分段继续使用 CDP 文档坐标；普通可见区域
+  // 和框选已提前返回，避免浏览器缩放后的混合坐标。
   const clip = full ? {
     x: 0, y: 0, width: cssWidth, height: cssHeight
   } : {
@@ -862,7 +874,6 @@ async function main() {
   const profileDir=temporary?path.join(args.profileDir,`once-${process.pid}`):args.profileDir;
   fs.mkdirSync(path.dirname(profileDir),{recursive:true});
   const ctx=await launchBrowser(args,profileDir);
-  // 初始缩放仅用作检测用户后续 Ctrl+滚轮变化，不会重置浏览器缩放设置。
   let closed=false;
   let active=null;
   let markClosed;
@@ -894,7 +905,6 @@ async function main() {
   try{
     await page.goto(args.url,{waitUntil:'domcontentloaded',timeout:45000});
     await page.waitForTimeout(500);
-    args.initialBrowserDpr=await page.evaluate(()=>window.devicePixelRatio).catch(()=>undefined);
     await page.evaluate(barScript).catch(()=>{});
     console.log(`成功打开：${page.url()}`);
   }catch(e){
