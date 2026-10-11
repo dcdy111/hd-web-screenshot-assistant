@@ -213,6 +213,54 @@ async function main() {
     assert.equal(largeSelection.effectiveDpr,4);
     assert.equal(largeSelection.actualWidth,720);
     assert.equal(largeSelection.actualHeight,480);
+    // Chrome Ctrl+mouse-wheel browser zoom regression (not CSS transform/zoom).
+    await page.setViewportSize({width:960,height:720});
+    await page.setContent(`<!doctype html><style>
+      html,body{margin:0;width:1700px;height:1800px;background:#fff}
+      .fixed-flag{position:fixed;left:24px;top:30px;width:120px;height:100px;background:#ff0000}
+      .another{position:fixed;left:240px;top:180px;width:100px;height:100px;background:#0000ff}
+      .footer{position:absolute;left:150px;top:1400px;width:200px;height:150px;background:#00ff00}
+    </style><div class="fixed-flag"></div><div class="another"></div><div class="footer"></div>`);
+    const zoomArgs={...args,width:960,height:720,dpr:3};
+    zoomArgs.initialBrowserDpr=await page.evaluate(()=>window.devicePixelRatio);
+    await page.mouse.move(400,350);
+    await page.keyboard.down('Control');
+    await page.mouse.wheel(0,-452);
+    await page.keyboard.up('Control');
+    await page.waitForTimeout(600);
+    const currentBrowserDpr=await page.evaluate(()=>window.devicePixelRatio);
+    const zoomObserved=Math.abs(currentBrowserDpr-zoomArgs.initialBrowserDpr)>0.025;
+    console.log('Chrome Ctrl+wheel zoom: before='+zoomArgs.initialBrowserDpr+
+      ', after='+currentBrowserDpr+', applied='+zoomObserved);
+    if(!zoomObserved) {
+      // Some headless Chrome builds ignore OS-level Ctrl+wheel events;
+      // emulate a changed device ratio for the same coordinate/verification path.
+      const client=await page.context().newCDPSession(page);
+      await client.send('Emulation.setDeviceMetricsOverride',{
+        width:960,height:720,deviceScaleFactor:1.5,mobile:false
+      });
+      await client.detach();
+      await page.waitForTimeout(250);
+    }
+    await page.evaluate(()=>window.scrollTo(170,145));
+    const zoomRect=await captureBuffer(page,zoomArgs,{rect:{x:10,y:10,width:160,height:140}});
+    const zoomFactor=zoomRect.pixel.width/160;
+    assert.deepEqual(await pixelAt(page,zoomRect.buffer,
+      Math.round(55*zoomFactor),Math.round(55*zoomFactor)),[255,0,0,255],
+      'Ctrl+wheel zoom + page scroll must not displace the selected red marker');
+    const zoomViewport=await captureBuffer(page,zoomArgs);
+    const currentScale=zoomViewport.pixel.width/zoomViewport.cssWidth;
+    assert.deepEqual(await pixelAt(page,zoomViewport.buffer,
+      Math.round(80*currentScale),Math.round(80*currentScale)),[255,0,0,255],
+      'Ctrl+wheel zoom must keep the fixed red flag at correct screenshot coordinates');
+    const zoomPdf=await snapshotPdf(page,zoomArgs,{rect:{x:10,y:10,width:160,height:140}});
+    assert.equal(fs.readFileSync(zoomPdf.filePath).subarray(0,4).toString(),'%PDF');
+    const zoomPdfImg=fs.readFileSync(zoomPdf.companionPngPath);
+    assert.deepEqual(await pixelAt(page,zoomPdfImg,
+      Math.round(55*(zoomRect.pixel.width/160)),
+      Math.round(55*(zoomRect.pixel.width/160))),[255,0,0,255],
+      'PDF companion PNG must remain aligned under Chrome zoom');
+    console.log('Browser zoom regression passed: selected PNG, viewport PNG, and PDF while scrolled.');
     console.log('Browser E2E passed: continuous capture, PDF, viewport bounds, and adaptive DPR on 2560x1305');
   } finally {
     await ctx.close();
