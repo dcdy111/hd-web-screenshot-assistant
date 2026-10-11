@@ -508,9 +508,53 @@ async function renderedContentBounds(page) {
   }
 }
 
+// 高倍 CDP 截图可能在 Chrome Ctrl+滚轮缩放后产生“尺寸正确、画面错位”。
+// 以 Playwright 的可见画面为基准比较缩略图；若两者不一致则保留原生像素，
+// 不将错误画面放大后写入 Word / PDF。
+async function compareRenderedImages(page, baseline, candidate) {
+  return page.evaluate(async ({baseline,candidate}) => {
+    const decode = async data => {
+      const img = new Image();
+      img.src = 'data:image/png;base64,' + data;
+      await img.decode();
+      return img;
+    };
+    const a = await decode(baseline);
+    const b = await decode(candidate);
+    const sw=48,sh=32;
+    const canvas=document.createElement('canvas');
+    canvas.width=sw;canvas.height=sh;
+    const g=canvas.getContext('2d',{willReadFrequently:true});
+    if (!g) return false;
+    const pixels=img=>{
+      g.clearRect(0,0,sw,sh);
+      g.drawImage(img,0,0,sw,sh);
+      return g.getImageData(0,0,sw,sh).data;
+    };
+    const pa=pixels(a),pb=pixels(b);
+    canvas.width=0;canvas.height=0;
+    let total=0,large=0,count=0;
+    // 忽略缩放时滚动条位置变化及边缘抗锯齿。
+    for(let y=2;y<sh-2;y++)for(let x=2;x<sw-2;x++){
+      const k=(y*sw+x)*4;
+      const v=(Math.abs(pa[k]-pb[k])+Math.abs(pa[k+1]-pb[k+1])+Math.abs(pa[k+2]-pb[k+2]))/3;
+      total+=v;if(v>44)large++;count++;
+    }
+    return total/count <= 20 && large/count <= 0.18;
+  },{baseline:baseline.toString('base64'),candidate:candidate.toString('base64')});
+}
+
+async function playwrightReference(page, {x,y,width,height,full=false}, scale='css') {
+  const clip=full?undefined:{x,y,width,height};
+  return page.screenshot({type:'png',fullPage:full,scale,
+    ...(clip?{clip}:{}),animations:'disabled',caret:'hide',timeout:60000});
+}
+
 async function captureBuffer(page, args, options={}) {
   const sizes = await metrics(page, args);
-  const viewport = page.viewportSize() || {width: sizes.viewportWidth, height: sizes.viewportHeight};
+  // 浏览器页面缩放会改变 CSS 可视区，即便物理窗口宽高没有变化。
+  // 不再用 Playwright 的固定 viewportSize（物理布局配置）限制用户框选。
+  const viewport = {width:sizes.viewportWidth,height:sizes.viewportHeight};
   const regionRequested = options.rect && Number.isFinite(Number(options.rect.width)) ? {
     x: Math.max(0, Math.floor(Number(options.rect.x)||0)),
     y: Math.max(0, Math.floor(Number(options.rect.y)||0)),
@@ -528,8 +572,11 @@ async function captureBuffer(page, args, options={}) {
   const full = Boolean(options.fullPage) && !region && !docRect;
   const startX = docRect ? docRect.x : full ? 0 : sizes.scrollX + (region ? region.x : 0);
   const startY = docRect ? docRect.y : full ? 0 : sizes.scrollY + (region ? region.y : 0);
-  // 只有整页/当前屏允许自动裁边；框选与内部文档分段保留精确矩形。
-  const canTrim = !region && !docRect && (full || sizes.hasContentSurface);
+  // Ctrl+滚轮缩放后网页重排，DOM边界和像素裁边可能还在过渡中。
+  // 在动态缩放状态下优先保留完整可见区域，防止裁掉导航栏或内容。
+  const zoomChanged = Number.isFinite(args.initialBrowserDpr) &&
+    Math.abs((await page.evaluate(()=>window.devicePixelRatio))-args.initialBrowserDpr)>0.025;
+  const canTrim = !region && !docRect && (full || (!zoomChanged && sizes.hasContentSurface));
   const requestedWidth = docRect ? docRect.width : region ? region.width : full ? sizes.scrollWidth : viewport.width;
   const requestedHeight = docRect ? docRect.height : region ? region.height : full ? sizes.scrollHeight : viewport.height;
   let cssWidth = canTrim && sizes.contentWidth > startX
@@ -538,7 +585,7 @@ async function captureBuffer(page, args, options={}) {
     ? Math.min(requestedHeight, sizes.contentHeight - startY) : requestedHeight;
   // 普通当前屏进一步排除网站未使用的纯色边缘。
   // 框选按用户坐标原样输出；整页仍以页面/DOM边界为准。
-  if (!region && !full && !docRect) {
+  if (!region && !full && !docRect && !zoomChanged) {
     const pixels = await renderedContentBounds(page);
     if (pixels) {
       const scaleX=viewport.width/pixels.width,scaleY=viewport.height/pixels.height;
@@ -584,11 +631,37 @@ async function captureBuffer(page, args, options={}) {
     });
     buffer = Buffer.from(shot.data, 'base64');
   } finally { await client.detach().catch(()=>{}); }
-  const pixel = pngSize(buffer);
-  const expectedW = Math.round(cssWidth * effectiveDpr), expectedH = Math.round(cssHeight * effectiveDpr);
-  if (Math.abs(pixel.width-expectedW)>Math.max(4,expectedW*.025) || Math.abs(pixel.height-expectedH)>Math.max(4,expectedH*.025))
-    throw new Error(`截图尺寸异常：实际 ${pixel.width}×${pixel.height}，预期约 ${expectedW}×${expectedH}。已取消保存，避免得到含大面积空白的文件。`);
-  return {buffer,cssWidth,cssHeight,pixel,full,region,zoom:sizes.zoom,effectiveDpr};
+  let pixel=pngSize(buffer);
+  const expectedW=Math.round(cssWidth*effectiveDpr),expectedH=Math.round(cssHeight*effectiveDpr);
+  let qualityDpr=effectiveDpr;
+  let captureMethod='cdp-verified';
+  const sizeMatches=Math.abs(pixel.width-expectedW)<=Math.max(4,expectedW*.025)
+    && Math.abs(pixel.height-expectedH)<=Math.max(4,expectedH*.025);
+  // 普通当前屏与框选必须与浏览器真实可见内容相符，不能只检查 PNG 尺寸。
+  // 长页面分段模式沿用单独的整页坐标处理，不做额外大图解码。
+  if(!full && !docRect){
+    const referenceOptions={x:startX,y:startY,width:cssWidth,height:cssHeight};
+    let reference=null;
+    try{reference=await playwrightReference(page,referenceOptions,'css');}
+    catch(err){console.warn('截图参考帧不可用，使用原生浏览器截图：'+err.message);}
+    let aligned=false;
+    if(reference&&sizeMatches) {
+      try{aligned=await compareRenderedImages(page,reference,buffer);}
+      catch(err){console.warn('截图画面对齐校验失败：'+err.message);}
+    }
+    if(!aligned){
+      // 该路径由 Chromium/Playwright 处理缩放、滚动以及多显示器 DPI。
+      // 不做人工插值放大，避免错误图像伪装成“4倍高清”。
+      buffer=await playwrightReference(page,referenceOptions,'device');
+      pixel=pngSize(buffer);
+      qualityDpr=Math.round(pixel.width/cssWidth*100)/100;
+      captureMethod='playwright-native';
+      console.warn(`[已自动纠偏] 高倍截图与当前网页不一致，已保存原生清晰截图 ${pixel.width}×${pixel.height}，实际倍率 ×${qualityDpr}`);
+    }
+  }else if(!sizeMatches) {
+    throw new Error(`截图尺寸异常：实际 ${pixel.width}×${pixel.height}，预期约 ${expectedW}×${expectedH}`);
+  }
+  return {buffer,cssWidth,cssHeight,pixel,full,region,zoom:sizes.zoom,effectiveDpr:qualityDpr,captureMethod};
 }
 
 function createName(page, tag, extension) {
@@ -764,6 +837,7 @@ async function main() {
   const profileDir=temporary?path.join(args.profileDir,`once-${process.pid}`):args.profileDir;
   fs.mkdirSync(path.dirname(profileDir),{recursive:true});
   const ctx=await launchBrowser(args,profileDir);
+  // 初始缩放仅用作检测用户后续 Ctrl+滚轮变化，不会重置浏览器缩放设置。
   let closed=false;
   let active=null;
   let markClosed;
@@ -795,6 +869,7 @@ async function main() {
   try{
     await page.goto(args.url,{waitUntil:'domcontentloaded',timeout:45000});
     await page.waitForTimeout(500);
+    args.initialBrowserDpr=await page.evaluate(()=>window.devicePixelRatio).catch(()=>undefined);
     await page.evaluate(barScript).catch(()=>{});
     console.log(`成功打开：${page.url()}`);
   }catch(e){
